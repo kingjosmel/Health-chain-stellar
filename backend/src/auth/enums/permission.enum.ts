@@ -54,6 +54,10 @@ export enum Permission {
   MANAGE_SOROBAN = 'manage:soroban',
   VIEW_BLOCKCHAIN = 'view:blockchain',
 
+  // ── Reputation ────────────────────────────────────────────────────────
+  VIEW_REPUTATION = 'view:reputation',
+  MANAGE_REPUTATION = 'manage:reputation',
+
   // ── Admin ─────────────────────────────────────────────────────────────
   ADMIN_ACCESS = 'admin:access',
   MANAGE_ROLES = 'manage:roles',

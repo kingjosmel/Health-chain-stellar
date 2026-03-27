@@ -2,13 +2,16 @@ import { InjectQueue } from '@nestjs/bull';
 import { Injectable, Logger } from '@nestjs/common';
 
 import {
+  assertSorobanTxJob,
+} from '../../common/guards/on-chain-id.guard';
+import {
   SorobanTxJob,
   SorobanTxResult,
   QueueMetrics,
 } from '../types/soroban-tx.types';
 
 import { IdempotencyService } from './idempotency.service';
-import { QueueMetricsService } from './queue-metrics.service';
+import { JobDeduplicationPlugin } from '../plugins/job-deduplication.plugin';
 
 import type { Queue } from 'bull';
 
@@ -23,7 +26,7 @@ export class SorobanService {
     @InjectQueue('soroban-tx-queue') private txQueue: Queue,
     @InjectQueue('soroban-dlq') private dlq: Queue,
     private idempotencyService: IdempotencyService,
-    private queueMetricsService: QueueMetricsService,
+    private deduplicationPlugin: JobDeduplicationPlugin,
   ) {}
 
   /**
@@ -35,6 +38,8 @@ export class SorobanService {
    * @throws Error if idempotency key already exists (duplicate submission)
    */
   async submitTransaction(job: SorobanTxJob): Promise<string> {
+    assertSorobanTxJob(job);
+
     // Enforce idempotency: prevent duplicate submissions
     const isNew = await this.idempotencyService.checkAndSetIdempotencyKey(
       job.idempotencyKey,
@@ -45,6 +50,20 @@ export class SorobanService {
         `Duplicate submission detected for idempotency key: ${job.idempotencyKey}`,
       );
       throw new Error('Duplicate submission - idempotency key already exists');
+    }
+
+    // Check for duplicate job within dedup window
+    const isDedupNew = await this.deduplicationPlugin.checkAndSetJobDedup(
+      job.contractMethod,
+      job.args,
+    );
+
+    if (!isDedupNew) {
+      this.logger.warn(
+        `Duplicate job suppressed (within dedup window): ${job.contractMethod}`,
+        { idempotencyKey: job.idempotencyKey },
+      );
+      throw new Error('Duplicate job - equivalent job enqueued recently');
     }
 
     const maxRetries = job.maxRetries ?? this.DEFAULT_MAX_RETRIES;
@@ -135,16 +154,59 @@ export class SorobanService {
     }
 
     const state = await job.getState();
+    const data = job.data as { transactionHash?: string };
 
     return {
       jobId: String(job.id),
-      transactionHash: job.data.transactionHash,
+      transactionHash: data.transactionHash,
       status: state as 'pending' | 'completed' | 'failed' | 'dlq',
       error: job.failedReason,
       retryCount: job.attemptsMade,
       createdAt: new Date(job.timestamp),
       completedAt: job.finishedOn ? new Date(job.finishedOn) : undefined,
     };
+  }
+
+  /**
+   * Check and atomically set callback event idempotency key.
+   * Rejects replayed callback events.
+   *
+   * @param eventId - Unique callback event ID
+   */
+  async checkAndSetCallbackIdempotency(eventId: string): Promise<boolean> {
+    return this.idempotencyService.checkAndSetIdempotencyKey(
+      `callback:${eventId}`,
+    );
+  }
+
+  /**
+   * Process an incoming blockchain callback via webhook.
+   * Ensures callback data is securely handled and logged.
+   *
+   * @param callback - Verified callback payload
+   */
+  async processWebhookCallback(callback: {
+    eventId: string;
+    transactionHash: string;
+    contractMethod: string;
+    status: 'pending' | 'confirmed' | 'failed';
+    timestamp: string;
+    details?: string;
+  }): Promise<void> {
+    this.logger.log(
+      `Processing blockchain callback event ${callback.eventId}`,
+      {
+        transactionHash: callback.transactionHash,
+        contractMethod: callback.contractMethod,
+        status: callback.status,
+        timestamp: callback.timestamp,
+      },
+    );
+
+    // TODO: map callback to persistent state or queue side effects.
+    // e.g., persist to database, update workflow state, or publish domain events.
+
+    await Promise.resolve();
   }
 
   /**

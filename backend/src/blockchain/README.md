@@ -81,6 +81,36 @@ Get status of a queued transaction.
 - `failed`: Retrying or moved to DLQ
 - `dlq`: Permanently failed, manual intervention needed
 
+#### POST /blockchain/webhook/callback
+Process incoming blockchain webhook events from trusted providers.
+
+Headers:
+- `X-Webhook-Signature`: HMAC SHA256 (hex) of canonical JSON payload using `BLOCKCHAIN_CALLBACK_SECRET`
+
+Request body:
+```json
+{
+  "eventId": "string",
+  "transactionHash": "string",
+  "contractMethod": "string",
+  "status": "pending|confirmed|failed",
+  "timestamp": "ISO-8601",
+  "details": "string (optional)"
+}
+```
+
+Response: `200 OK`
+```json
+{
+  "success": true
+}
+```
+
+Failures:
+- `401 Unauthorized`: invalid or missing signature
+- `400 Bad Request`: stale timestamp or invalid payload schema
+- `409 Conflict`: replayed event
+
 #### GET /blockchain/queue/status
 Get queue metrics (admin only).
 

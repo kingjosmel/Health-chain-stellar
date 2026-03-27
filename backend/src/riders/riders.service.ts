@@ -1,35 +1,36 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-
-export type RiderStatus = 'available' | 'busy' | 'offline';
-
-export interface RiderRecord {
-  id: string;
-  name: string;
-  status: RiderStatus;
-  latitude: number | null;
-  longitude: number | null;
-  activeDeliveries: number;
-  averageRating: number;
-  createdAt: Date;
-  updatedAt: Date;
-}
+import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { RiderEntity } from './entities/rider.entity';
+import { CreateRiderDto } from './dto/create-rider.dto';
+import { UpdateRiderDto } from './dto/update-rider.dto';
+import { RegisterRiderDto } from './dto/register-rider.dto';
+import { RiderStatus } from './enums/rider-status.enum';
 
 @Injectable()
 export class RidersService {
-  private readonly riders = new Map<string, RiderRecord>();
+  constructor(
+    @InjectRepository(RiderEntity)
+    private readonly riderRepository: Repository<RiderEntity>,
+  ) {}
 
-  async findAll(status?: string) {
-    const data = Array.from(this.riders.values()).filter(
-      (rider) => !status || rider.status === status,
-    );
+  async findAll(status?: RiderStatus) {
+    const where = status ? { status } : {};
+    const riders = await this.riderRepository.find({
+      where,
+      relations: ['user'],
+    });
     return {
       message: 'Riders retrieved successfully',
-      data,
+      data: riders,
     };
   }
 
   async findOne(id: string) {
-    const rider = this.riders.get(id);
+    const rider = await this.riderRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
     if (!rider) {
       throw new NotFoundException(`Rider '${id}' not found`);
     }
@@ -39,105 +40,131 @@ export class RidersService {
     };
   }
 
-  async create(createRiderDto: any) {
-    const now = new Date();
-    const id = createRiderDto.id ?? `rider-${Date.now()}`;
-    const rider: RiderRecord = {
-      id,
-      name: createRiderDto.name ?? id,
-      status: (createRiderDto.status ?? 'available') as RiderStatus,
-      latitude: createRiderDto.latitude ?? null,
-      longitude: createRiderDto.longitude ?? null,
-      activeDeliveries: Number(createRiderDto.activeDeliveries ?? 0),
-      averageRating: Number(createRiderDto.averageRating ?? 5),
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.riders.set(id, rider);
+  async findByUserId(userId: string) {
+    const rider = await this.riderRepository.findOne({
+      where: { userId },
+      relations: ['user'],
+    });
+    if (!rider) {
+      throw new NotFoundException(`Rider for user '${userId}' not found`);
+    }
     return {
-      message: 'Rider created successfully',
+      message: 'Rider profile retrieved successfully',
       data: rider,
     };
   }
 
-  async update(id: string, updateRiderDto: any) {
-    const existing = this.riders.get(id);
-    if (!existing) {
-      throw new NotFoundException(`Rider '${id}' not found`);
+  async create(createRiderDto: CreateRiderDto) {
+    const existing = await this.riderRepository.findOne({
+      where: { userId: createRiderDto.userId },
+    });
+    if (existing) {
+      throw new ConflictException(`Rider for user '${createRiderDto.userId}' already exists`);
     }
-    const updated: RiderRecord = {
-      ...existing,
-      ...updateRiderDto,
-      averageRating:
-        updateRiderDto.averageRating !== undefined
-          ? Number(updateRiderDto.averageRating)
-          : existing.averageRating,
-      activeDeliveries:
-        updateRiderDto.activeDeliveries !== undefined
-          ? Number(updateRiderDto.activeDeliveries)
-          : existing.activeDeliveries,
-      updatedAt: new Date(),
+
+    const rider = this.riderRepository.create(createRiderDto);
+    const saved = await this.riderRepository.save(rider);
+    return {
+      message: 'Rider created successfully',
+      data: saved,
     };
-    this.riders.set(id, updated);
+  }
+
+  async register(userId: string, registerRiderDto: RegisterRiderDto) {
+    const existing = await this.riderRepository.findOne({
+      where: { userId },
+    });
+    if (existing) {
+      throw new ConflictException(`Rider for user '${userId}' already exists`);
+    }
+
+    const rider = this.riderRepository.create({
+      ...registerRiderDto,
+      userId,
+      status: RiderStatus.OFFLINE,
+      isVerified: false,
+    });
+    const saved = await this.riderRepository.save(rider);
+    return {
+      message: 'Rider registration submitted successfully. Awaiting verification.',
+      data: saved,
+    };
+  }
+
+  async update(id: string, updateRiderDto: UpdateRiderDto) {
+    const rider = await this.findOne(id);
+    const updated = Object.assign(rider.data, updateRiderDto);
+    const saved = await this.riderRepository.save(updated);
     return {
       message: 'Rider updated successfully',
-      data: updated,
+      data: saved,
+    };
+  }
+
+  async verify(id: string) {
+    const riderResult = await this.findOne(id);
+    const rider = riderResult.data;
+    rider.isVerified = true;
+    if (rider.status === RiderStatus.OFFLINE) {
+      rider.status = RiderStatus.AVAILABLE;
+    }
+    const saved = await this.riderRepository.save(rider);
+    return {
+      message: 'Rider verified successfully',
+      data: saved,
     };
   }
 
   async remove(id: string) {
-    if (!this.riders.has(id)) {
-      throw new NotFoundException(`Rider '${id}' not found`);
-    }
-    this.riders.delete(id);
+    const riderResult = await this.findOne(id);
+    await this.riderRepository.remove(riderResult.data);
     return {
       message: 'Rider deleted successfully',
       data: { id },
     };
   }
 
-  async updateStatus(id: string, status: string) {
-    const rider = this.riders.get(id);
-    if (!rider) {
-      throw new NotFoundException(`Rider '${id}' not found`);
-    }
-    rider.status = status as RiderStatus;
-    rider.updatedAt = new Date();
-    this.riders.set(id, rider);
+  async updateStatus(id: string, status: RiderStatus) {
+    const riderResult = await this.findOne(id);
+    const rider = riderResult.data;
+    rider.status = status;
+    const saved = await this.riderRepository.save(rider);
     return {
       message: 'Rider status updated successfully',
-      data: rider,
+      data: saved,
     };
   }
 
   async updateLocation(id: string, latitude: number, longitude: number) {
-    const rider = this.riders.get(id);
-    if (!rider) {
-      throw new NotFoundException(`Rider '${id}' not found`);
-    }
+    const riderResult = await this.findOne(id);
+    const rider = riderResult.data;
     rider.latitude = latitude;
     rider.longitude = longitude;
-    rider.updatedAt = new Date();
-    this.riders.set(id, rider);
+    const saved = await this.riderRepository.save(rider);
     return {
       message: 'Rider location updated successfully',
-      data: rider,
+      data: saved,
     };
   }
 
   async getAvailableRiders() {
-    const data = Array.from(this.riders.values()).filter(
-      (rider) => rider.status === 'available',
-    );
+    const riders = await this.riderRepository.find({
+      where: { status: RiderStatus.AVAILABLE, isVerified: true },
+    });
     return {
       message: 'Available riders retrieved successfully',
-      data,
+      data: riders,
     };
   }
 
-  async getNearbyRiders(latitude: number, longitude: number, radius: number) {
-    const radiusKm = Number(radius);
-    const data = Array.from(this.riders.values()).filter((rider) => {
+  async getNearbyRiders(latitude: number, longitude: number, radiusKm: number) {
+    // Basic approximation using square bounding box before actual distance calculation if needed
+    // For more accurate results, use spatial extensions or a manual formula in query
+    const riders = await this.riderRepository.find({
+      where: { status: RiderStatus.AVAILABLE, isVerified: true },
+    });
+
+    const nearbyRiders = riders.filter((rider) => {
       if (rider.latitude === null || rider.longitude === null) {
         return false;
       }
@@ -148,9 +175,10 @@ export class RidersService {
         Math.cos((latitude * Math.PI) / 180);
       return Math.sqrt(latKm ** 2 + lngKm ** 2) <= radiusKm;
     });
+
     return {
       message: 'Nearby riders retrieved successfully',
-      data,
+      data: nearbyRiders,
     };
   }
 }

@@ -1,7 +1,9 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /// <reference types="jest" />
 import { getQueueToken } from '@nestjs/bull';
 import { Test, TestingModule } from '@nestjs/testing';
 
+import { JobDeduplicationPlugin } from '../plugins/job-deduplication.plugin';
 import { IdempotencyService } from '../services/idempotency.service';
 import { QueueMetricsService } from '../services/queue-metrics.service';
 import { SorobanService } from '../services/soroban.service';
@@ -9,10 +11,21 @@ import { SorobanTxJob } from '../types/soroban-tx.types';
 
 describe('SorobanService', () => {
   let service: SorobanService;
-  let mockTxQueue: any;
-  let mockDlq: any;
-  let mockIdempotencyService: any;
-  let mockQueueMetricsService: any;
+  let mockTxQueue: {
+    add: jest.Mock;
+    count: jest.Mock;
+    getFailedCount: jest.Mock;
+    getJob: jest.Mock;
+  };
+  let mockDlq: {
+    count: jest.Mock;
+  };
+  let mockIdempotencyService: {
+    checkAndSetIdempotencyKey: jest.Mock;
+  };
+  let mockDeduplicationPlugin: {
+    checkAndSetJobDedup: jest.Mock;
+  };
 
   beforeEach(async () => {
     mockTxQueue = {
@@ -37,13 +50,8 @@ describe('SorobanService', () => {
       checkAndSetIdempotencyKey: jest.fn().mockResolvedValue(true),
     };
 
-    mockQueueMetricsService = {
-      getDetailedMetrics: jest.fn().mockResolvedValue({
-        counters: { queued: 10, processing: 1, success: 7, failure: 2, retries: 3, dlq: 1 },
-        timings: { avgMs: 120, minMs: 80, maxMs: 300, samples: 7 },
-        live: { waiting: 4, active: 1, failed: 2, delayed: 0, dlqDepth: 1 },
-        since: '2026-01-01T00:00:00.000Z',
-      }),
+    mockDeduplicationPlugin = {
+      checkAndSetJobDedup: jest.fn().mockResolvedValue(true),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -62,8 +70,8 @@ describe('SorobanService', () => {
           useValue: mockIdempotencyService,
         },
         {
-          provide: QueueMetricsService,
-          useValue: mockQueueMetricsService,
+          provide: JobDeduplicationPlugin,
+          useValue: mockDeduplicationPlugin,
         },
       ],
     }).compile();
@@ -435,6 +443,33 @@ describe('SorobanService', () => {
       expect(typeof metrics.queueDepth).toBe('number');
       expect(typeof metrics.failedJobs).toBe('number');
       expect(typeof metrics.dlqCount).toBe('number');
+    });
+  });
+
+  describe('callback idempotency', () => {
+    it('should check and set callback idempotency via IdempotencyService', async () => {
+      mockIdempotencyService.checkAndSetIdempotencyKey.mockResolvedValueOnce(
+        true,
+      );
+
+      const result = await service.checkAndSetCallbackIdempotency('evt-1');
+
+      expect(result).toBe(true);
+      expect(
+        mockIdempotencyService.checkAndSetIdempotencyKey,
+      ).toHaveBeenCalledWith('callback:evt-1');
+    });
+
+    it('should process webhook callback without error', async () => {
+      await expect(
+        service.processWebhookCallback({
+          eventId: 'evt-1',
+          transactionHash: 'tx-1',
+          contractMethod: 'register_blood',
+          status: 'confirmed',
+          timestamp: new Date().toISOString(),
+        }),
+      ).resolves.toBeUndefined();
     });
   });
 });

@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 
 import { Repository } from 'typeorm';
 
+import { assertMonotonicTimestamp } from '../../common/timestamp/monotonic-timestamp.util';
 import { OrderEventEntity } from '../entities/order-event.entity';
 import { OrderEventType } from '../enums/order-event-type.enum';
 import { OrderStatus } from '../enums/order-status.enum';
@@ -38,8 +39,28 @@ export class OrderEventStoreService {
 
   /**
    * Appends a new immutable event row to the order_events table.
+   *
+   * Monotonic-timestamp guard: if a previous event exists for this order,
+   * the incoming wall-clock time must be strictly after the last event's
+   * timestamp.  This prevents out-of-order or back-dated events from being
+   * committed and keeps the audit log temporally consistent.
    */
   async persistEvent(dto: CreateOrderEventDto): Promise<OrderEventEntity> {
+    const lastEvents = await this.eventRepo.find({
+      where: { orderId: dto.orderId },
+      order: { timestamp: 'DESC' },
+      take: 1,
+    });
+
+    if (lastEvents.length > 0) {
+      const now = new Date();
+      assertMonotonicTimestamp(
+        lastEvents[0].timestamp,
+        now,
+        `order event '${dto.eventType}' for order '${dto.orderId}'`,
+      );
+    }
+
     const entity = this.eventRepo.create({
       orderId: dto.orderId,
       eventType: dto.eventType,

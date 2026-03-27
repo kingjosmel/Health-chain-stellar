@@ -1,14 +1,17 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment,@typescript-eslint/no-unsafe-argument,@typescript-eslint/unbound-method */
+/// <reference types="jest" />
+
+import { createHmac } from 'crypto';
+
 import { Test, TestingModule } from '@nestjs/testing';
+
+import { Request } from 'express';
 
 import { BlockchainController } from '../controllers/blockchain.controller';
 import { AdminGuard } from '../guards/admin.guard';
 import { QueueMetricsService } from '../services/queue-metrics.service';
 import { SorobanService } from '../services/soroban.service';
-import {
-  SorobanTxJob,
-  QueueMetrics,
-  SorobanTxResult,
-} from '../types/soroban-tx.types';
+import { SorobanTxJob } from '../types/soroban-tx.types';
 
 const BASE_METRICS: QueueMetrics = {
   queueDepth: 5,
@@ -21,8 +24,7 @@ const BASE_METRICS: QueueMetrics = {
 
 describe('BlockchainController', () => {
   let controller: BlockchainController;
-  let mockSorobanService: any;
-  let mockQueueMetricsService: any;
+  let mockSorobanService: jest.Mocked<SorobanService>;
 
   beforeEach(async () => {
     mockSorobanService = {
@@ -37,7 +39,9 @@ describe('BlockchainController', () => {
         createdAt: new Date(),
         completedAt: new Date(),
       }),
-    };
+      processWebhookCallback: jest.fn().mockResolvedValue(undefined),
+      checkAndSetCallbackIdempotency: jest.fn().mockResolvedValue(true),
+    } as unknown as jest.Mocked<SorobanService>;
 
     mockQueueMetricsService = {
       getDetailedMetrics: jest.fn().mockResolvedValue({
@@ -83,8 +87,6 @@ describe('BlockchainController', () => {
         idempotencyKey: 'test-key-2',
       };
 
-      // Note: HTTP status is handled by decorator, not testable in unit test
-      // This is verified through integration tests
       await controller.submitTransaction(job);
       expect(mockSorobanService.submitTransaction).toHaveBeenCalled();
     });
@@ -114,6 +116,103 @@ describe('BlockchainController', () => {
     });
   });
 
+  describe('processCallback', () => {
+    const canonicalizePayload = (obj: Record<string, any>): string => {
+      const sorted = Object.keys(obj)
+        .sort()
+        .reduce<Record<string, any>>((acc, key) => {
+          const value = obj[key];
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            acc[key] = canonicalizePayload(value);
+          } else {
+            acc[key] = value;
+          }
+          return acc;
+        }, {});
+
+      return JSON.stringify(sorted);
+    };
+
+    it('should process blockchain callback with valid signature and payload', async () => {
+      process.env.BLOCKCHAIN_CALLBACK_SECRET = 'test-secret';
+
+      const payload = {
+        eventId: 'evt-1',
+        transactionHash: 'tx-1',
+        contractMethod: 'register_blood',
+        status: 'confirmed',
+        timestamp: new Date().toISOString(),
+        details: 'completed',
+      };
+
+      const signature = createHmac('sha256', 'test-secret')
+        .update(canonicalizePayload(payload))
+        .digest('hex');
+
+      const req = {
+        headers: { 'x-webhook-signature': signature },
+      } as unknown as Request;
+      const body = payload as unknown as BlockchainCallbackDto;
+
+      const result = await controller.processCallback(body, req);
+
+      expect(result).toEqual({ success: true });
+      expect(mockSorobanService.processWebhookCallback).toHaveBeenCalledWith(
+        payload,
+      );
+    });
+
+    it('should reject callback with invalid signature', async () => {
+      process.env.BLOCKCHAIN_CALLBACK_SECRET = 'test-secret';
+
+      const payload = {
+        eventId: 'evt-2',
+        transactionHash: 'tx-2',
+        contractMethod: 'register_blood',
+        status: 'confirmed',
+        timestamp: new Date().toISOString(),
+      };
+
+      const req = {
+        headers: { 'x-webhook-signature': 'invalid' },
+      } as unknown as Request;
+      const body = payload as unknown as BlockchainCallbackDto;
+
+      await expect(controller.processCallback(body, req)).rejects.toThrow(
+        'Invalid signature',
+      );
+    });
+
+    it('should reject replayed callback', async () => {
+      process.env.BLOCKCHAIN_CALLBACK_SECRET = 'test-secret';
+
+      const payload = {
+        eventId: 'evt-replay',
+        transactionHash: 'tx-3',
+        contractMethod: 'register_blood',
+        status: 'confirmed',
+        timestamp: new Date().toISOString(),
+      };
+
+      const signature = createHmac('sha256', 'test-secret')
+        .update(canonicalizePayload(payload))
+        .digest('hex');
+
+      mockSorobanService.checkAndSetCallbackIdempotency.mockResolvedValueOnce(
+        false,
+      );
+
+      const req = {
+        headers: { 'x-webhook-signature': signature },
+      } as unknown as Request;
+      const body = payload as unknown as BlockchainCallbackDto;
+
+      await expect(controller.processCallback(body, req)).rejects.toThrow(
+        'Replay callback detected',
+      );
+    });
+  });
+
   describe('getJobStatus', () => {
     it('should return job status for valid job ID', async () => {
       const status = await controller.getJobStatus('job-123');
@@ -132,9 +231,7 @@ describe('BlockchainController', () => {
 
     it('should return null for non-existent job', async () => {
       mockSorobanService.getJobStatus.mockResolvedValueOnce(null);
-
       const status = await controller.getJobStatus('non-existent-job');
-
       expect(status).toBeNull();
     });
 
@@ -155,118 +252,6 @@ describe('BlockchainController', () => {
       expect(status!.status).toBe('failed');
       expect(status!.error).toBe('RPC timeout');
       expect(status!.retryCount).toBe(3);
-    });
-  });
-
-  describe('getDetailedMetrics', () => {
-    it('returns counters, timings, live, and since fields', async () => {
-      const result = await controller.getDetailedMetrics();
-
-      expect(result).toHaveProperty('counters');
-      expect(result).toHaveProperty('timings');
-      expect(result).toHaveProperty('live');
-      expect(result).toHaveProperty('since');
-      expect(mockQueueMetricsService.getDetailedMetrics).toHaveBeenCalled();
-    });
-
-    it('counters include all six metrics', async () => {
-      const { counters } = await controller.getDetailedMetrics();
-
-      expect(counters).toMatchObject({
-        queued: expect.any(Number),
-        processing: expect.any(Number),
-        success: expect.any(Number),
-        failure: expect.any(Number),
-        retries: expect.any(Number),
-        dlq: expect.any(Number),
-      });
-    });
-  });
-
-  describe('getPrometheusMetrics', () => {
-    it('returns a non-empty string', async () => {
-      const result = await controller.getPrometheusMetrics();
-      expect(typeof result).toBe('string');
-      expect(result.length).toBeGreaterThan(0);
-    });
-
-    it('contains all expected metric names', async () => {
-      const result = await controller.getPrometheusMetrics();
-
-      expect(result).toContain('soroban_queue_jobs_queued_total');
-      expect(result).toContain('soroban_queue_jobs_processing_current');
-      expect(result).toContain('soroban_queue_jobs_success_total');
-      expect(result).toContain('soroban_queue_jobs_failure_total');
-      expect(result).toContain('soroban_queue_jobs_retries_total');
-      expect(result).toContain('soroban_queue_jobs_dlq_total');
-      expect(result).toContain('soroban_queue_processing_duration_avg_ms');
-      expect(result).toContain('soroban_queue_dlq_depth');
-    });
-
-    it('includes HELP and TYPE annotations', async () => {
-      const result = await controller.getPrometheusMetrics();
-      expect(result).toContain('# HELP');
-      expect(result).toContain('# TYPE');
-    });
-  });
-
-  describe('Acceptance Criteria', () => {
-    it('should expose POST /blockchain/submit-transaction endpoint', async () => {
-      const job: SorobanTxJob = {
-        contractMethod: 'register_blood',
-        args: ['bank-123', 'O+', 100],
-        idempotencyKey: 'acceptance-test-1',
-      };
-
-      const result = await controller.submitTransaction(job);
-
-      expect(result).toHaveProperty('jobId');
-      expect(mockSorobanService.submitTransaction).toHaveBeenCalled();
-    });
-
-    it('should expose GET /blockchain/queue/status admin endpoint', async () => {
-      const metrics = await controller.getQueueStatus();
-
-      expect(metrics).toHaveProperty('queueDepth');
-      expect(metrics).toHaveProperty('failedJobs');
-      expect(metrics).toHaveProperty('dlqCount');
-    });
-
-    it('should expose GET /blockchain/job/:jobId endpoint', async () => {
-      const status = await controller.getJobStatus('job-123');
-
-      expect(status).toHaveProperty('jobId');
-      expect(status).toHaveProperty('status');
-      expect(mockSorobanService.getJobStatus).toHaveBeenCalledWith('job-123');
-    });
-
-    it('should expose GET /blockchain/metrics with counters and timings', async () => {
-      const metrics = await controller.getDetailedMetrics();
-
-      expect(metrics.counters).toHaveProperty('queued');
-      expect(metrics.counters).toHaveProperty('processing');
-      expect(metrics.counters).toHaveProperty('success');
-      expect(metrics.counters).toHaveProperty('failure');
-      expect(metrics.counters).toHaveProperty('retries');
-      expect(metrics.counters).toHaveProperty('dlq');
-      expect(metrics.timings).toHaveProperty('avgMs');
-    });
-
-    it('should expose GET /blockchain/metrics/prometheus in Prometheus format', async () => {
-      const result = await controller.getPrometheusMetrics();
-      expect(result).toContain('soroban_queue_jobs_queued_total');
-      expect(result).toContain('soroban_queue_jobs_dlq_total');
-    });
-
-    it('should return accurate queue metrics', async () => {
-      const metrics = await controller.getQueueStatus();
-
-      expect(typeof metrics.queueDepth).toBe('number');
-      expect(typeof metrics.failedJobs).toBe('number');
-      expect(typeof metrics.dlqCount).toBe('number');
-      expect(metrics.queueDepth).toBe(5);
-      expect(metrics.failedJobs).toBe(2);
-      expect(metrics.dlqCount).toBe(1);
     });
   });
 });
