@@ -8,6 +8,10 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import {
+  PermissionsService,
+  UserContext,
+} from '../../auth/permissions.service';
 import { NotificationsService } from '../../notifications/notifications.service';
 import { NotificationChannel } from '../../notifications/enums/notification-channel.enum';
 import {
@@ -49,6 +53,7 @@ export class RequestStatusService {
     private readonly ordersGateway: OrdersGateway,
     private readonly eventEmitter: EventEmitter2,
     private readonly inventoryService: InventoryService,
+    private readonly permissionsService: PermissionsService,
     @Optional()
     @InjectRepository(BlockchainEvent)
     private readonly blockchainEventRepo?: Repository<BlockchainEvent>,
@@ -65,7 +70,12 @@ export class RequestStatusService {
     const nextStatus = this.resolveNextStatus(dto);
     const previousStatus = order.status;
 
-    this.enforceActionRole(dto.action, actorRole);
+    if (actorRole) {
+      this.enforceActionRole(dto.action, {
+        id: actorId ?? '',
+        role: actorRole,
+      });
+    }
     this.stateMachine.transition(previousStatus, nextStatus);
 
     const eventType = STATUS_TO_EVENT_TYPE[nextStatus];
@@ -82,7 +92,10 @@ export class RequestStatusService {
       actorId,
     });
 
-    if (nextStatus === OrderStatus.CANCELLED && previousStatus !== OrderStatus.DELIVERED) {
+    if (
+      nextStatus === OrderStatus.CANCELLED &&
+      previousStatus !== OrderStatus.DELIVERED
+    ) {
       await this.inventoryService.restoreStockOrThrow(
         order.bloodBankId ?? '',
         order.bloodType,
@@ -111,8 +124,19 @@ export class RequestStatusService {
       timestamp: new Date(),
     });
 
-    await this.trySyncWithBlockchain(order, previousStatus, nextStatus, actorId, dto.reason);
-    await this.tryNotifyStatusChange(order, previousStatus, nextStatus, dto.reason);
+    await this.trySyncWithBlockchain(
+      order,
+      previousStatus,
+      nextStatus,
+      actorId,
+      dto.reason,
+    );
+    await this.tryNotifyStatusChange(
+      order,
+      previousStatus,
+      nextStatus,
+      dto.reason,
+    );
 
     this.logger.log(
       `Request ${order.id} status updated: ${previousStatus} -> ${nextStatus}`,
@@ -131,7 +155,9 @@ export class RequestStatusService {
         return OrderStatus.CONFIRMED;
       case RequestStatusAction.REJECT:
         if (!dto.reason) {
-          throw new BadRequestException('A reason is required when rejecting a request.');
+          throw new BadRequestException(
+            'A reason is required when rejecting a request.',
+          );
         }
         return OrderStatus.CANCELLED;
       case RequestStatusAction.FULFILL:
@@ -139,26 +165,27 @@ export class RequestStatusService {
       case RequestStatusAction.CANCEL:
         return OrderStatus.CANCELLED;
       default:
-        throw new BadRequestException('Either action or status must be provided.');
+        throw new BadRequestException(
+          'Either action or status must be provided.',
+        );
     }
   }
 
-  private enforceActionRole(action: RequestStatusAction | undefined, actorRole?: string): void {
-    if (!action || !actorRole) {
-      return;
+  private enforceActionRole(
+    action: RequestStatusAction | undefined,
+    actor: UserContext,
+  ): void {
+    if (!action) return;
+
+    if (
+      action === RequestStatusAction.APPROVE ||
+      action === RequestStatusAction.REJECT
+    ) {
+      this.permissionsService.assertCanApproveRequest(actor);
     }
 
-    const normalizedRole = actorRole.toUpperCase();
-
-    const approvalRoles = new Set(['ADMIN', 'BLOOD_BANK', 'BLOOD_BANK_STAFF']);
-    const fulfillmentRoles = new Set(['ADMIN', 'RIDER', 'DISPATCHER', 'BLOOD_BANK', 'BLOOD_BANK_STAFF']);
-
-    if ((action === RequestStatusAction.APPROVE || action === RequestStatusAction.REJECT) && !approvalRoles.has(normalizedRole)) {
-      throw new BadRequestException(`Role '${actorRole}' is not allowed to ${action.toLowerCase()} requests.`);
-    }
-
-    if (action === RequestStatusAction.FULFILL && !fulfillmentRoles.has(normalizedRole)) {
-      throw new BadRequestException(`Role '${actorRole}' is not allowed to fulfill requests.`);
+    if (action === RequestStatusAction.FULFILL) {
+      this.permissionsService.assertCanFulfillRequest(actor);
     }
   }
 
@@ -195,17 +222,27 @@ export class RequestStatusService {
         break;
 
       case OrderStatus.IN_TRANSIT:
-        this.eventEmitter.emit('order.in_transit', new OrderInTransitEvent(order.id));
+        this.eventEmitter.emit(
+          'order.in_transit',
+          new OrderInTransitEvent(order.id),
+        );
         break;
 
       case OrderStatus.DELIVERED:
-        this.eventEmitter.emit('order.delivered', new OrderDeliveredEvent(order.id));
+        this.eventEmitter.emit(
+          'order.delivered',
+          new OrderDeliveredEvent(order.id),
+        );
         break;
 
       case OrderStatus.CANCELLED:
         this.eventEmitter.emit(
           'order.cancelled',
-          new OrderCancelledEvent(order.id, order.hospitalId, reason ?? 'Status transition'),
+          new OrderCancelledEvent(
+            order.id,
+            order.hospitalId,
+            reason ?? 'Status transition',
+          ),
         );
         break;
     }
@@ -241,7 +278,9 @@ export class RequestStatusService {
       await this.blockchainEventRepo.save(entity);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.warn(`Blockchain sync failed for order ${order.id}: ${message}`);
+      this.logger.warn(
+        `Blockchain sync failed for order ${order.id}: ${message}`,
+      );
     }
   }
 
