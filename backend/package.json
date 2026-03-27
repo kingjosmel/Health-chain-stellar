@@ -25,7 +25,6 @@
   },
   "dependencies": {
     "@nest-lab/throttler-storage-redis": "^1.2.0",
-    "@nestjs/bull": "^11.0.4",
     "@nestjs/bullmq": "^11.0.4",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.2",
@@ -43,7 +42,6 @@
     "@stellar/stellar-sdk": "^14.5.0",
     "@types/bull": "^3.15.9",
     "africastalking": "^0.7.9",
-    "bull": "^4.16.5",
     "bullmq": "^5.69.3",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
