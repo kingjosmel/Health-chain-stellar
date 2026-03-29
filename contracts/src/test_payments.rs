@@ -7,6 +7,16 @@ use crate::payments::{
 
 use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, Env, String, Symbol};
 
+fn default_fee_structure(env: &Env) -> FeeStructure {
+    FeeStructure {
+        policy_id: Symbol::new(env, "default_fee_policy"),
+        service_fee: 0,
+        network_fee: 0,
+        performance_bonus: 0,
+        fixed_fee: 0,
+    }
+}
+
 fn payment_with_status(env: &Env, status: PaymentStatus) -> Payment {
     Payment {
         id: 1,
@@ -15,6 +25,7 @@ fn payment_with_status(env: &Env, status: PaymentStatus) -> Payment {
         payee: Address::generate(env),
         amount: 1_000,
         asset: Address::generate(env),
+        fee_structure: default_fee_structure(env),
         status,
         escrow_released_at: None,
     }
@@ -37,6 +48,7 @@ fn payment_validates_successfully() {
         payee,
         amount: 1_000,
         asset,
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Pending,
         escrow_released_at: None,
     };
@@ -55,6 +67,7 @@ fn payment_fails_with_zero_amount() {
         payee: Address::generate(&env),
         amount: 0,
         asset: Address::generate(&env),
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Pending,
         escrow_released_at: None,
     };
@@ -74,6 +87,7 @@ fn payment_fails_when_payer_equals_payee() {
         payee: addr.clone(),
         amount: 1_000,
         asset: Address::generate(&env),
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Pending,
         escrow_released_at: None,
     };
@@ -93,6 +107,7 @@ fn payment_fails_when_asset_equals_payer() {
         payee: Address::generate(&env),
         amount: 1_000,
         asset: payer,
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Pending,
         escrow_released_at: None,
     };
@@ -112,6 +127,7 @@ fn payment_fails_when_asset_equals_payee() {
         payee: payee.clone(),
         amount: 1_000,
         asset: payee,
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Pending,
         escrow_released_at: None,
     };
@@ -279,6 +295,7 @@ fn terminal_states_are_enforced() {
             payee: Address::generate(&env),
             amount: 1_000,
             asset: Address::generate(&env),
+            fee_structure: default_fee_structure(&env),
             status,
             escrow_released_at: None,
         };
@@ -339,6 +356,7 @@ fn escrow_release_integration_rejects_premature_and_unauthorized_attempts() {
         payee: Address::generate(&env),
         amount: 5_000,
         asset: Address::generate(&env),
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Escrowed,
         escrow_released_at: None,
     };
@@ -375,6 +393,7 @@ fn escrow_release_integration_allows_release_only_when_all_guards_pass() {
         payee: Address::generate(&env),
         amount: 7_500,
         asset: Address::generate(&env),
+        fee_structure: default_fee_structure(&env),
         status: PaymentStatus::Escrowed,
         escrow_released_at: None,
     };
@@ -400,10 +419,13 @@ fn escrow_release_integration_allows_release_only_when_all_guards_pass() {
 
 #[test]
 fn fee_calculation_is_correct() {
+    let env = Env::default();
     let fees = FeeStructure {
+        policy_id: Symbol::new(&env, "default_fee_policy"),
         service_fee: 10,
         network_fee: 5,
         performance_bonus: 5,
+        fixed_fee: 0,
     };
 
     assert_eq!(fees.total(), 20);
@@ -412,10 +434,13 @@ fn fee_calculation_is_correct() {
 
 #[test]
 fn fees_cannot_exceed_payment_amount() {
+    let env = Env::default();
     let fees = FeeStructure {
+        policy_id: Symbol::new(&env, "default_fee_policy"),
         service_fee: 600,
         network_fee: 300,
         performance_bonus: 200,
+        fixed_fee: 0,
     };
 
     assert_eq!(
