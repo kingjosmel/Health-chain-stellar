@@ -3,12 +3,15 @@ import { Module } from '@nestjs/common';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
+import { PolicyCenterModule } from '../policy-center/policy-center.module';
+
 import { NotificationTemplateEntity } from './entities/notification-template.entity';
 import { NotificationEntity } from './entities/notification.entity';
 import { NotificationPreference } from './entities/notification-preference.entity';
 import { NotificationDeliveryLog } from './entities/notification-delivery-log.entity';
 import { NotificationsGateway } from './gateways/notifications.gateway';
 import { OrderNotificationListener } from './listeners/order-notification.listener';
+import { EscalationNotificationListener } from './listeners/escalation-notification.listener';
 import { NotificationsController } from './notifications.controller';
 import { NotificationPreferenceController } from './controllers/notification-preference.controller';
 import { NotificationsService } from './notifications.service';
@@ -31,6 +34,7 @@ import { SmsProvider } from './providers/sms.provider';
       name: 'notifications',
     }),
     EventEmitterModule.forRoot(),
+    PolicyCenterModule,
   ],
   controllers: [NotificationsController, NotificationPreferenceController],
   providers: [
@@ -48,6 +52,7 @@ import { SmsProvider } from './providers/sms.provider';
 
     // Listeners
     OrderNotificationListener,
+    EscalationNotificationListener,
 
     // Services
     NotificationsService,

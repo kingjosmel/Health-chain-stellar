@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 
 import { Repository, SelectQueryBuilder } from 'typeorm';
+import { PolicyCenterService } from '../policy-center/policy-center.service';
 
 import {
   InventorySortField,
@@ -22,6 +23,7 @@ export interface InventoryStatistics {
   byBloodType: Record<string, number>;
   byComponent: Record<string, number>;
   totalVolumeMl: number;
+  policyVersionRef?: string;
 }
 
 export interface AvailabilityResult {
@@ -37,6 +39,7 @@ export class BloodInventoryQueryService {
   constructor(
     @InjectRepository(BloodUnit)
     private readonly bloodUnitRepository: Repository<BloodUnit>,
+    private readonly policyCenterService: PolicyCenterService,
   ) {}
 
   async query(dto: QueryBloodInventoryDto): Promise<{
@@ -75,8 +78,11 @@ export class BloodInventoryQueryService {
   }
 
   async getStatistics(bankId?: string): Promise<InventoryStatistics> {
+    const policy = await this.policyCenterService.getActivePolicySnapshot();
     const now = new Date();
-    const soonThreshold = new Date(now.getTime() + 72 * 60 * 60 * 1000); // 72 hours
+    const soonThreshold = new Date(
+      now.getTime() + policy.rules.inventory.expiringSoonHours * 60 * 60 * 1000,
+    );
 
     const qb = this.bloodUnitRepository.createQueryBuilder('u');
     if (bankId) {
@@ -123,7 +129,58 @@ export class BloodInventoryQueryService {
       byBloodType,
       byComponent,
       totalVolumeMl,
+      policyVersionRef: policy.policyVersionId,
     };
+  }
+
+  async findNearby(params: {
+    lat: number;
+    lng: number;
+    radiusKm: number;
+    bloodType?: BloodType;
+    limit?: number;
+    offset?: number;
+  }): Promise<{
+    data: (BloodUnit & { distanceMetres: number })[];
+    total: number;
+  }> {
+    const radiusMetres = params.radiusKm * 1000;
+    const { lat, lng, bloodType, limit = 20, offset = 0 } = params;
+
+    // Use raw query for ST_DWithin and distance calculation
+    // ST_Distance(location, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography)
+    const query = this.bloodUnitRepository
+      .createQueryBuilder('u')
+      .addSelect(
+        'ST_Distance(u.location, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography)',
+        'distanceMetres',
+      )
+      .where(
+        'ST_DWithin(u.location, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, :radiusMetres)',
+        { lng, lat, radiusMetres },
+      )
+      .andWhere('u.status = :status', { status: BloodStatus.AVAILABLE })
+      .andWhere('u.expiresAt > :now', { now: new Date() });
+
+    if (bloodType) {
+      query.andWhere('u.bloodType = :bloodType', { bloodType });
+    }
+
+    query
+      .orderBy('"distanceMetres"', 'ASC')
+      .limit(limit)
+      .offset(offset);
+
+    const { entities, raw } = await query.getRawAndEntities();
+
+    const data = entities.map((entity, index) => ({
+      ...entity,
+      distanceMetres: Math.round(raw[index].distanceMetres),
+    }));
+
+    const total = await query.getCount();
+
+    return { data, total };
   }
 
   private buildQuery(

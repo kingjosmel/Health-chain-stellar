@@ -22,10 +22,16 @@ import {
   TransferCustodyDto,
   LogTemperatureDto,
 } from './dto/blood-units.dto';
-import { BloodUnitEntity } from './entities/blood-unit.entity';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { TransferRecord, TransferStatus } from './entities/transfer-record.entity';
+import { BloodUnit, BloodUnitEntity } from './entities/blood-unit.entity';
 import { BloodStatus } from './enums/blood-status.enum';
 import { QuarantineReasonCode, QuarantineTriggerSource } from './enums/quarantine.enums';
 import { QuarantineService } from './services/quarantine.service';
+import { OrganizationEntity } from '../organizations/entities/organization.entity';
+
+
+
 
 interface AuthenticatedUserContext {
   id: string;
@@ -44,11 +50,21 @@ export class BloodUnitsService {
     private readonly permissionsService: PermissionsService,
     private readonly donorEligibilityService: DonorEligibilityService,
     private readonly quarantineService: QuarantineService,
+    private readonly eventEmitter: EventEmitter2,
     @InjectRepository(BloodUnitTrail)
+
     private readonly trailRepository: Repository<BloodUnitTrail>,
     @InjectRepository(BloodUnitEntity)
     private readonly bloodUnitRepository: Repository<BloodUnitEntity>,
+    @InjectRepository(BloodUnit)
+    private readonly inventoryRepository: Repository<BloodUnit>,
+    @InjectRepository(TransferRecord)
+    private readonly transferRepository: Repository<TransferRecord>,
+    @InjectRepository(OrganizationEntity)
+    private readonly orgRepository: Repository<OrganizationEntity>,
   ) {}
+
+
 
   async registerBloodUnit(
     dto: RegisterBloodUnitDto,
@@ -156,6 +172,141 @@ export class BloodUnitsService {
       message: 'Custody transferred successfully',
     };
   }
+
+  /**
+   * Phase 1 of inter-org transfer: Initiate.
+   * Status transitions to IN_TRANSFER.
+   * Closes #465
+   */
+  async initiateOrganizationTransfer(
+    unitId: string,
+    destinationOrgId: string,
+    reason?: string,
+    user?: AuthenticatedUserContext,
+  ) {
+    const unit = await this.inventoryRepository.findOne({
+      where: { id: unitId },
+    });
+
+    if (!unit) {
+      throw new NotFoundException(`Blood unit ${unitId} not found`);
+    }
+
+    // Must be owner org
+    if (unit.organizationId !== (user as any)?.organizationId && user?.role !== 'admin') {
+      throw new BadRequestException('Only the owner organization can initiate a transfer');
+    }
+
+    if (unit.status !== BloodStatus.AVAILABLE) {
+      throw new BadRequestException(`Unit must be AVAILABLE to transfer (current: ${unit.status})`);
+    }
+
+    unit.status = BloodStatus.IN_TRANSFER;
+    await this.inventoryRepository.save(unit);
+
+    const transfer = this.transferRepository.create({
+      bloodUnitId: unitId,
+      sourceOrgId: unit.organizationId,
+      destinationOrgId,
+      reason,
+      status: TransferStatus.PENDING,
+      initiatedByUserId: user?.id,
+    });
+    await this.transferRepository.save(transfer);
+
+    this.eventEmitter.emit('blood-unit.transfer.initiated', {
+      unitId,
+      transferId: transfer.id,
+      sourceOrgId: unit.organizationId,
+      destinationOrgId,
+      initiatedBy: user?.id,
+    });
+
+    return {
+      success: true,
+      transferId: transfer.id,
+      status: unit.status,
+    };
+  }
+
+  /**
+   * Phase 2 of inter-org transfer: Accept.
+   * Status transitions back to AVAILABLE (at new org).
+   * Closes #465
+   */
+  async acceptOrganizationTransfer(unitId: string, user?: AuthenticatedUserContext) {
+    const unit = await this.inventoryRepository.findOne({
+      where: { id: unitId },
+    });
+
+    if (!unit) {
+      throw new NotFoundException(`Blood unit ${unitId} not found`);
+    }
+
+    const transfer = await this.transferRepository.findOne({
+      where: {
+        bloodUnitId: unitId,
+        status: TransferStatus.PENDING,
+      },
+      order: { createdAt: 'DESC' },
+    });
+
+    if (!transfer) {
+      throw new BadRequestException('No pending transfer found for this unit');
+    }
+
+    // Must be destination org
+    if (transfer.destinationOrgId !== (user as any)?.organizationId && user?.role !== 'admin') {
+      throw new BadRequestException('Only the destination organization can accept the transfer');
+    }
+
+    const previousOrgId = unit.organizationId;
+    unit.organizationId = transfer.destinationOrgId;
+    unit.status = BloodStatus.AVAILABLE;
+    await this.inventoryRepository.save(unit);
+
+    transfer.status = TransferStatus.ACCEPTED;
+    transfer.acceptedByUserId = user?.id || null;
+    transfer.acceptedAt = new Date();
+    await this.transferRepository.save(transfer);
+
+    // Update Soroban - publish custody transfer to blockchain
+    try {
+      if (unit.blockchainUnitId) {
+        const [sourceOrg, destOrg] = await Promise.all([
+          this.orgRepository.findOne({ where: { id: previousOrgId } }),
+          this.orgRepository.findOne({ where: { id: unit.organizationId } }),
+        ]);
+
+        if (sourceOrg?.blockchainAddress && destOrg?.blockchainAddress) {
+          await this.sorobanService.transferCustody({
+            unitId: Number(unit.blockchainUnitId),
+            fromAccount: sourceOrg.blockchainAddress,
+            toAccount: destOrg.blockchainAddress,
+            condition: 'Inter-Organization Transfer',
+          });
+        }
+      }
+    } catch (error) {
+       this.logger.warn(`Failed to sync transfer acceptance to Soroban for unit ${unitId}: ${error.message}`);
+    }
+
+    this.eventEmitter.emit('blood-unit.transfer.accepted', {
+
+      unitId,
+      transferId: transfer.id,
+      sourceOrgId: previousOrgId,
+      destinationOrgId: unit.organizationId,
+      acceptedBy: user?.id,
+    });
+
+    return {
+      success: true,
+      unitId,
+      newOrganizationId: unit.organizationId,
+    };
+  }
+
 
   async logTemperature(dto: LogTemperatureDto) {
     const matchedUnit = await this.findByBlockchainUnitId(dto.unitId);

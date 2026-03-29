@@ -5,11 +5,17 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   VersionColumn,
+  Index,
 } from 'typeorm';
 
 import { OrderStatus } from '../enums/order-status.enum';
+import { EscalationTier } from '../../escalation/enums/escalation-tier.enum';
 
 @Entity('orders')
+@Index('IDX_ORDERS_HOSPITAL_ID', ['hospitalId'])
+@Index('IDX_ORDERS_BLOOD_BANK_ID', ['bloodBankId'])
+@Index('IDX_ORDERS_STATUS', ['status'])
+@Index('IDX_ORDERS_CREATED_AT', ['createdAt'])
 export class OrderEntity {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -68,5 +74,13 @@ export class OrderEntity {
 
   @Column({ name: 'applied_policy_id', type: 'uuid', nullable: true })
   appliedPolicyId: string | null;
+
+  @Column({
+    name: 'escalation_tier',
+    type: 'varchar',
+    length: 16,
+    default: EscalationTier.NONE,
+  })
+  escalationTier: EscalationTier;
 }
 

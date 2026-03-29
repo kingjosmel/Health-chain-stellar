@@ -12,6 +12,7 @@ import {
   ParseIntPipe,
   ParseUUIDPipe,
   ParseEnumPipe,
+  BadRequestException,
 } from '@nestjs/common';
 
 import { Request } from 'express';
@@ -99,6 +100,39 @@ export class BloodUnitsController {
     return this.bloodUnitsService.getUnitTrail(id);
   }
 
+  /**
+   * INTER-ORG TRANSFER: Step 1: Initiate
+   */
+  @RequirePermissions(Permission.TRANSFER_CUSTODY)
+  @Post(':id/transfer')
+  @HttpCode(HttpStatus.CREATED)
+  async initiateTransfer(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { destinationOrgId: string; reason?: string },
+    @Req() request: Request & { user: { id: string; role: string; organizationId?: string } },
+  ) {
+    return this.bloodUnitsService.initiateOrganizationTransfer(
+      id,
+      body.destinationOrgId,
+      body.reason,
+      request.user,
+    );
+  }
+
+  /**
+   * INTER-ORG TRANSFER: Step 2: Accept
+   */
+  @RequirePermissions(Permission.TRANSFER_CUSTODY)
+  @Post(':id/transfer/accept')
+  @HttpCode(HttpStatus.OK)
+  async acceptTransfer(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() request: Request & { user: { id: string; role: string; organizationId?: string } },
+  ) {
+    return this.bloodUnitsService.acceptOrganizationTransfer(id, request.user);
+  }
+
+
   @RequirePermissions(Permission.UPDATE_BLOOD_STATUS)
   @Patch(':id/status')
   @HttpCode(HttpStatus.OK)
@@ -176,4 +210,36 @@ export class BloodUnitsController {
       requiredVolumeMl,
     );
   }
+
+  @Get('nearby')
+  async findNearby(
+    @Query('lat') lat: string,
+    @Query('lng') lng: string,
+    @Query('radius') radius: string,
+    @Query('bloodType') bloodType?: BloodType,
+  ) {
+    if (!lat || !lng || !radius) {
+      const errors: string[] = [];
+      if (!lat) errors.push('lat is required');
+      if (!lng) errors.push('lng is required');
+      if (!radius) errors.push('radius is required');
+      throw new BadRequestException(errors.join(', '));
+    }
+
+    const latitude = parseFloat(lat);
+    const longitude = parseFloat(lng);
+    const radiusKm = parseFloat(radius);
+
+    if (isNaN(latitude) || isNaN(longitude) || isNaN(radiusKm)) {
+      throw new BadRequestException('lat, lng, and radius must be valid numbers');
+    }
+
+    return this.inventoryQueryService.findNearby({
+      lat: latitude,
+      lng: longitude,
+      radiusKm,
+      bloodType,
+    });
+  }
 }
+

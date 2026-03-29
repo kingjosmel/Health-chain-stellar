@@ -33,6 +33,7 @@ export const ALLOWED_TRANSITIONS: Record<BloodStatus, BloodStatus[]> = {
   [BloodStatus.AVAILABLE]: [
     BloodStatus.RESERVED,
     BloodStatus.IN_TRANSIT,
+    BloodStatus.IN_TRANSFER,
     BloodStatus.QUARANTINED,
     BloodStatus.PROCESSING,
     BloodStatus.EXPIRED,
@@ -45,6 +46,7 @@ export const ALLOWED_TRANSITIONS: Record<BloodStatus, BloodStatus[]> = {
     BloodStatus.EXPIRED,
   ],
   [BloodStatus.IN_TRANSIT]: [BloodStatus.DELIVERED, BloodStatus.DISCARDED],
+  [BloodStatus.IN_TRANSFER]: [BloodStatus.AVAILABLE, BloodStatus.DISCARDED],
   [BloodStatus.DELIVERED]: [],
   [BloodStatus.EXPIRED]: [BloodStatus.DISCARDED],
   [BloodStatus.QUARANTINED]: [BloodStatus.AVAILABLE, BloodStatus.DISCARDED],
@@ -55,6 +57,7 @@ export const ALLOWED_TRANSITIONS: Record<BloodStatus, BloodStatus[]> = {
     BloodStatus.DISCARDED,
   ],
 };
+
 
 @Injectable()
 export class BloodStatusService {

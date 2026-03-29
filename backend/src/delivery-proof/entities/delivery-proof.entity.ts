@@ -64,6 +64,10 @@ export class DeliveryProofEntity extends BaseEntity {
   @Column({ name: 'verified', default: false })
   verified: boolean;
 
+  @Column({ name: 'blockchain_tx_hash', type: 'varchar', length: 128, nullable: true })
+  blockchainTxHash: string | null;
+
+
   // ─── Validation helpers ───────────────────────────────────────────────────
 
   validate(): void {

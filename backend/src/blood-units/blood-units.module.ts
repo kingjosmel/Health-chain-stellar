@@ -7,6 +7,7 @@ import { BlockchainEvent } from '../soroban/entities/blockchain-event.entity';
 import { BloodUnitTrail } from '../soroban/entities/blood-unit-trail.entity';
 import { SorobanModule } from '../soroban/soroban.module';
 import { DonorEligibilityModule } from '../donor-eligibility/donor-eligibility.module';
+import { PolicyCenterModule } from '../policy-center/policy-center.module';
 
 import { BloodInventoryQueryService } from './blood-inventory-query.service';
 import { BloodStatusService } from './blood-status.service';
@@ -22,6 +23,8 @@ import { QuarantineCase } from './entities/quarantine-case.entity';
 import { DispositionController } from './controllers/disposition.controller';
 import { QuarantineController } from './controllers/quarantine.controller';
 import { DispositionService } from './services/disposition.service';
+import { TransferRecord } from './entities/transfer-record.entity';
+
 
 @Module({
   imports: [
@@ -35,10 +38,13 @@ import { DispositionService } from './services/disposition.service';
       OrderEntity,
       UnitDispositionRecord,
       QuarantineCase,
+      TransferRecord,
     ]),
+
     SorobanModule,
     NotificationsModule,
     DonorEligibilityModule,
+    PolicyCenterModule,
   ],
   controllers: [BloodUnitsController, DispositionController, QuarantineController],
   providers: [
