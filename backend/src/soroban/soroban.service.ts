@@ -442,6 +442,51 @@ export class SorobanService implements OnModuleInit {
     });
   }
 
+  /**
+   * Anchor a hash on-chain for proof of existence (e.g. delivery proof)
+   * Closes #464
+   */
+  async anchorHash(
+    targetId: string,
+    hash: string,
+  ): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'anchor_hash',
+            xdr.ScVal.scvString(targetId),
+            xdr.ScVal.scvString(hash),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+        await this.saveEvent({
+          eventType: 'hash_anchored',
+          transactionHash: response.hash,
+          data: { targetId, hash },
+        });
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+
   async quarantineBloodUnit(params: {
     unitId: number;
     caller?: string;

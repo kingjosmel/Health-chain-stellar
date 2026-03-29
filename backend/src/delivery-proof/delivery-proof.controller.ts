@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 import { CreateDeliveryProofDto } from './dto/create-delivery-proof.dto';
 import { DeliveryProofQueryDto } from './dto/delivery-proof-query.dto';
@@ -12,6 +13,21 @@ export class DeliveryProofController {
   create(@Body() dto: CreateDeliveryProofDto) {
     return this.service.create(dto);
   }
+
+  /**
+   * Endpoint for tamper-evident photo upload.
+   * Multipart/form-data, max 5MB.
+   * Closes #464
+   */
+  @Post(':orderId/upload')
+  @UseInterceptors(FileInterceptor('image'))
+  async uploadPhoto(
+    @Param('orderId') orderId: string,
+    @UploadedFile() file: any, // Express.Multer.File
+  ) {
+    return this.service.uploadPhoto(orderId, file);
+  }
+
 
   @Get(':id')
   getOne(@Param('id') id: string) {
