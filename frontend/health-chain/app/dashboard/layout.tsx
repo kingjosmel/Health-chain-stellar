@@ -19,6 +19,7 @@ import {
   Upload,
   Droplets,
   FlaskConical,
+  Timer,
 } from "lucide-react";
 
 function classNames(...classes: (string | undefined | null | false)[]) {
@@ -36,6 +37,7 @@ const sidebarLinks = [
   { name: "Quarantine Review", href: "/admin/quarantine", icon: FlaskConical },
   { name: "Batch Import", href: "/admin/batch-import", icon: Upload },
   { name: "Expiration Forecast", href: "/admin/expiration-forecast", icon: Droplets },
+  { name: "SLA Tracking", href: "/dashboard/sla", icon: Timer },
 ];
 
 export default function DashboardLayout({
