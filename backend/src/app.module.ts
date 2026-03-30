@@ -40,7 +40,7 @@ import { TransparencyModule } from './transparency/transparency.module';
 import { ProofBundleModule } from './proof-bundle/proof-bundle.module';
 import { PolicyCenterModule } from './policy-center/policy-center.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
-import { ContractEventIndexerModule } from './contract-event-indexer/contract-event-indexer.module';
+import { HealthModule } from './health/health.module';
 
 import type Redis from 'ioredis';
 
@@ -120,7 +120,7 @@ import type Redis from 'ioredis';
     ProofBundleModule,
     PolicyCenterModule,
     ReconciliationModule,
-    ContractEventIndexerModule,
+    HealthModule,
   ],
   controllers: [AppController],
   providers: [
