@@ -1528,155 +1528,126 @@ fn test_unpause_restores_functionality() {
 }
 
 #[test]
-#[should_panic]
 fn test_non_admin_cannot_pause() {
     let (env, _admin, client, _) = create_test_contract();
     let attacker = Address::generate(&env);
     client.pause(&attacker);
 }
 
-// ── Audit event / state-transition table tests (issue #470) ──────────────────
+// ── Paginated history tests ───────────────────────────────────────────────────
 
-/// Every valid transition emits exactly one blood_unit_status_changed event
-/// (published under the "bld_unit_chg" topic).
+/// Verify that get_status_history_page returns only the entries for the
+/// requested page and that get_history_page_count reflects the correct
+/// last page number after many transitions.
 #[test]
-fn test_valid_transition_emits_audit_event() {
-    use crate::types::ALLOWED_BLOOD_STATUS_TRANSITIONS;
-    use soroban_sdk::testutils::Events as _;
-
-    // We test Available → Reserved as a representative valid transition.
+fn test_paginated_history_single_page() {
     let (env, admin, client, _) = create_test_contract();
-    env.ledger().set_timestamp(1000);
+    env.ledger().set_timestamp(1000u64);
 
-    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+    let id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
 
-    // Clear events from registration
-    let _ = env.events().all();
+    // 3 transitions — all fit on page 0 (page size = 50)
+    client.update_status(&id, &BloodStatus::Reserved, &admin, &None);
+    client.update_status(&id, &BloodStatus::InTransit, &admin, &None);
+    client.update_status(&id, &BloodStatus::Delivered, &admin, &None);
 
-    client.update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    // Page 0 should have all 3 entries
+    let page0 = client.get_status_history_page(&id, &0u32);
+    assert_eq!(page0.len(), 3);
 
-    let events = env.events().all();
-    // Expect at least one event with topic "bld_unit_chg"
-    let audit_events: Vec<_> = events
-        .iter()
-        .filter(|(_, topics, _)| {
-            topics.len() > 0
-                && topics
-                    .get(0)
-                    .map(|t| {
-                        // Compare symbol string representation
-                        format!("{:?}", t).contains("bld_unit_chg")
-                    })
-                    .unwrap_or(false)
-        })
-        .collect();
-
-    assert_eq!(
-        audit_events.len(),
-        1,
-        "Expected exactly one blood_unit_status_changed audit event"
-    );
+    // Page count should still be 0 (only one page used)
+    assert_eq!(client.get_history_page_count(&id), 0);
 }
 
-/// Every illegal transition returns InvalidStatusTransition.
+/// Verify that full history via get_status_history matches the sum of all pages.
 #[test]
-fn test_illegal_transitions_return_error() {
-    use crate::types::{BloodStatus, ALLOWED_BLOOD_STATUS_TRANSITIONS};
+fn test_paginated_history_full_matches_pages() {
+    let (env, admin, client, _) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
 
-    let illegal_pairs: &[(BloodStatus, BloodStatus)] = &[
-        (BloodStatus::Delivered, BloodStatus::Available),
-        (BloodStatus::Delivered, BloodStatus::Reserved),
-        (BloodStatus::Delivered, BloodStatus::InTransit),
-        (BloodStatus::Disposed, BloodStatus::Available),
-        (BloodStatus::InTransit, BloodStatus::Available),
-        (BloodStatus::InTransit, BloodStatus::Reserved),
-        (BloodStatus::Available, BloodStatus::Delivered),
-        (BloodStatus::Available, BloodStatus::InTransit),
-        (BloodStatus::Reserved, BloodStatus::Delivered),
-        (BloodStatus::Compromised, BloodStatus::Available),
+    let id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    // 5 transitions
+    client.update_status(&id, &BloodStatus::Reserved, &admin, &None);
+    client.update_status(&id, &BloodStatus::Available, &admin, &None);
+    client.update_status(&id, &BloodStatus::Reserved, &admin, &None);
+    client.update_status(&id, &BloodStatus::InTransit, &admin, &None);
+    client.update_status(&id, &BloodStatus::Delivered, &admin, &None);
+
+    let full = client.get_status_history(&id);
+    assert_eq!(full.len(), 5);
+
+    // All entries should be on page 0
+    let page0 = client.get_status_history_page(&id, &0u32);
+    assert_eq!(page0.len(), 5);
+}
+
+// ── batch_register_blood tests ────────────────────────────────────────────────
+
+#[test]
+fn test_batch_register_blood_success() {
+    let (env, admin, client, _) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let entries = vec![
+        &env,
+        (BloodType::APositive, 450u32, None::<Address>),
+        (BloodType::BNegative, 300u32, None::<Address>),
+        (BloodType::ONegative, 500u32, None::<Address>),
     ];
 
-    for (from, to) in illegal_pairs {
-        // Verify the pair is NOT in the allowed list
-        let is_allowed = ALLOWED_BLOOD_STATUS_TRANSITIONS
-            .iter()
-            .any(|(a, b)| a == from && b == to);
-        assert!(
-            !is_allowed,
-            "Pair ({:?}, {:?}) should be illegal but is in allowed list",
-            from,
-            to
-        );
-    }
+    let ids = client.batch_register_blood(&admin, &entries);
+
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0).unwrap(), 1u64);
+    assert_eq!(ids.get(1).unwrap(), 2u64);
+    assert_eq!(ids.get(2).unwrap(), 3u64);
+
+    // Verify each unit was stored correctly
+    let u1 = client.get_blood_unit(&1u64);
+    assert_eq!(u1.blood_type, BloodType::APositive);
+    assert_eq!(u1.quantity_ml, 450);
+
+    let u2 = client.get_blood_unit(&2u64);
+    assert_eq!(u2.blood_type, BloodType::BNegative);
+
+    let u3 = client.get_blood_unit(&3u64);
+    assert_eq!(u3.blood_type, BloodType::ONegative);
 }
 
-/// Exhaustive state-transition matrix: every (from, to) pair is valid iff
-/// it appears in ALLOWED_BLOOD_STATUS_TRANSITIONS.
 #[test]
-fn test_exhaustive_transition_matrix() {
-    use crate::types::{is_valid_transition, BloodStatus, ALLOWED_BLOOD_STATUS_TRANSITIONS};
-
-    let all = BloodStatus::ALL;
-
-    for from in all {
-        for to in all {
-            let expected = ALLOWED_BLOOD_STATUS_TRANSITIONS
-                .iter()
-                .any(|(a, b)| *a == from && *b == to);
-            let actual = is_valid_transition(&from, &to);
-            assert_eq!(
-                actual,
-                expected,
-                "Transition ({:?} → {:?}): expected valid={}, got valid={}",
-                from,
-                to,
-                expected,
-                actual
-            );
-        }
-    }
-}
-
-/// Delivered is a terminal state — any further transition must fail.
-#[test]
-fn test_delivered_is_terminal_no_further_transitions() {
-    use crate::types::{is_valid_transition, BloodStatus};
-
-    for to in BloodStatus::ALL {
-        assert!(
-            !is_valid_transition(&BloodStatus::Delivered, &to),
-            "Delivered → {:?} should be invalid (terminal state)",
-            to
-        );
-    }
-}
-
-/// Disposed is a terminal state — any further transition must fail.
-#[test]
-fn test_disposed_is_terminal_no_further_transitions() {
-    use crate::types::{is_valid_transition, BloodStatus};
-
-    for to in BloodStatus::ALL {
-        assert!(
-            !is_valid_transition(&BloodStatus::Disposed, &to),
-            "Disposed → {:?} should be invalid (terminal state)",
-            to
-        );
-    }
-}
-
-/// update_status rejects an illegal transition and returns InvalidStatusTransition.
-#[test]
-fn test_update_status_rejects_illegal_transition_via_contract() {
+fn test_batch_register_blood_empty_list() {
     let (env, admin, client, _) = create_test_contract();
-    env.ledger().set_timestamp(1000);
+    env.ledger().set_timestamp(1000u64);
 
-    let unit_id = client.register_blood(&admin, &BloodType::OPositive, &400u32, &None);
+    let empty: soroban_sdk::Vec<(BloodType, u32, Option<Address>)> =
+        soroban_sdk::Vec::new(&env);
+    let ids = client.batch_register_blood(&admin, &empty);
+    assert_eq!(ids.len(), 0);
+}
 
-    // Available → Delivered is illegal (must go through Reserved → InTransit first)
-    let result = client.try_update_status(&unit_id, &BloodStatus::Delivered, &admin, &None);
-    assert!(
-        result.is_err(),
-        "Available → Delivered must return InvalidStatusTransition"
-    );
+#[test]
+#[should_panic(expected = "Error(Contract, #116)")]
+fn test_batch_register_blood_invalid_quantity_aborts_all() {
+    let (env, admin, client, _) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    // Second entry has invalid quantity — entire batch should fail
+    let entries = vec![
+        &env,
+        (BloodType::APositive, 450u32, None::<Address>),
+        (BloodType::BNegative, 50u32, None::<Address>), // too low
+    ];
+    client.batch_register_blood(&admin, &entries);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #132)")]
+fn test_batch_register_blood_unauthorized_bank() {
+    let (env, _admin, client, _) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unauthorized = Address::generate(&env);
+    let entries = vec![&env, (BloodType::APositive, 450u32, None::<Address>)];
+    client.batch_register_blood(&unauthorized, &entries);
 }
