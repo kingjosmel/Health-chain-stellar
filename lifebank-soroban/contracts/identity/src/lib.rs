@@ -170,6 +170,7 @@ pub enum DataKey {
     AddressRoles(Address),
     // Fine-grained permission scopes (Issue #374)
     AddressScopes(Address),
+    Paused,
 }
 
 // ---------------------------------------------------------------------------

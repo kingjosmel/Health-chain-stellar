@@ -143,6 +143,81 @@ impl RequestContract {
         Ok(ids)
     }
 
+    /// Cancel a blood request. Only the owning hospital or the admin may cancel.
+    /// The request must be in Pending or Approved status.
+    pub fn cancel_request(
+        env: Env,
+        caller: Address,
+        request_id: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        storage::require_initialized(&env)?;
+
+        let mut request = storage::get_request(&env, request_id)
+            .ok_or(ContractError::RequestNotFound)?;
+
+        let admin = storage::get_admin(&env);
+        if caller != request.hospital_id && caller != admin {
+            return Err(ContractError::NotRequestOwner);
+        }
+
+        match request.status {
+            RequestStatus::Pending | RequestStatus::Approved => {}
+            _ => return Err(ContractError::InvalidRequestStatus),
+        }
+
+        request.status = RequestStatus::Cancelled;
+        storage::set_request(&env, &request);
+
+        events::emit_request_cancelled(
+            &env,
+            request_id,
+            &caller,
+            env.ledger().timestamp(),
+        );
+
+        Ok(())
+    }
+
+    /// Update the status of a blood request. Admin only.
+    /// Records the caller as the actor in the emitted event.
+    pub fn update_request_status(
+        env: Env,
+        caller: Address,
+        request_id: u64,
+        new_status: RequestStatus,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        storage::require_initialized(&env)?;
+
+        let admin = storage::get_admin(&env);
+        if caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let mut request = storage::get_request(&env, request_id)
+            .ok_or(ContractError::RequestNotFound)?;
+
+        if request.status == new_status {
+            return Err(ContractError::InvalidRequestStatus);
+        }
+
+        let old_status = request.status;
+        request.status = new_status;
+        storage::set_request(&env, &request);
+
+        events::emit_request_status_updated(
+            &env,
+            request_id,
+            &caller,
+            old_status,
+            new_status,
+            env.ledger().timestamp(),
+        );
+
+        Ok(())
+    }
+
     pub fn get_request(env: Env, request_id: u64) -> Result<BloodRequest, ContractError> {
         storage::require_initialized(&env)?;
         storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)

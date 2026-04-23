@@ -116,7 +116,7 @@ mod inventory_client {
 }
 
 mod payment_client {
-    use soroban_sdk::{contractclient, Env, String};
+    use soroban_sdk::{contractclient, contracttype, Env, String};
     use super::{Payment, PaymentStatus};
 
     #[contracttype]

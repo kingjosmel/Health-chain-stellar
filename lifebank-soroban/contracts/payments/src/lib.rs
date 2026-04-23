@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, Map,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map,
     String, Vec,
 };
 use soroban_sdk::token;
@@ -44,6 +44,8 @@ pub struct Payment {
     pub dispute_reason_code: Option<u32>,
     pub dispute_case_id: Option<String>,
     pub dispute_resolved: bool,
+    /// Token contract address — set only for escrow-backed payments.
+    pub token: Option<Address>,
 }
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
@@ -94,19 +96,13 @@ pub struct DonationPledge {
 }
 
 /// On-chain vesting schedule for donor reward tokens.
-/// Enforces a cliff + linear vesting so donors cannot withdraw immediately.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VestingSchedule {
-    /// Donor who will receive the vested tokens
     pub donor: Address,
-    /// Total reward tokens to vest
     pub total_amount: i128,
-    /// Ledger timestamp before which no tokens can be claimed
     pub cliff_timestamp: u64,
-    /// Ledger timestamp at which 100% of tokens are vested
     pub vest_end_timestamp: u64,
-    /// Amount already claimed by the donor
     pub claimed: i128,
 }
 
@@ -122,12 +118,19 @@ pub enum Error {
     InsufficientEscrowFunds = 505,
     Unauthorized = 506,
     ContractPaused = 507,
-    /// Claim attempted before the cliff timestamp
     CliffNotReached = 508,
-    /// Vesting schedule not found for this donor
     VestingNotFound = 509,
-    /// No additional tokens are claimable at this time
     NothingToClaim = 510,
+    /// A payment already exists for this request.
+    DuplicatePayment = 511,
+    /// The associated request is not in a state that permits payment.
+    RequestNotPayable = 512,
+    /// The request referenced by this payment does not exist.
+    RequestNotFound = 513,
+    /// Payment has no escrowed token — cannot release or refund funds.
+    NotEscrowPayment = 514,
+    /// Payment is not in the Locked state required for settlement.
+    PaymentNotLocked = 515,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -137,6 +140,12 @@ const PLEDGE_COUNTER: soroban_sdk::Symbol = symbol_short!("PLG_CTR");
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const REWARD_TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("RWD_TOK");
+/// Instance-level map: request_id (u64) → payment_id (u64).
+const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
+/// Instance-level aggregate stats.
+const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
+/// Instance storage key for the requests contract address (optional).
+const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
 
 fn payment_key(id: u64) -> (u64, &'static str) {
     (id, "pay")
@@ -146,17 +155,14 @@ fn pledge_key(id: u64) -> (u64, &'static str) {
     (id, "plg")
 }
 
-/// Persistent index: payer Address → Vec<u64> of payment IDs.
 fn payer_index_key(payer: &Address) -> (Address, &'static str) {
     (payer.clone(), "pi")
 }
 
-/// Persistent index: payee Address → Vec<u64> of payment IDs.
 fn payee_index_key(payee: &Address) -> (Address, &'static str) {
     (payee.clone(), "pyi")
 }
 
-/// Persistent index: PaymentStatus → Vec<u64> of payment IDs.
 fn status_index_key(status: PaymentStatus) -> (u32, &'static str) {
     let code = match status {
         PaymentStatus::Pending => 0u32,
@@ -215,6 +221,156 @@ fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
     env.storage().persistent().get(&vesting_key(donor))
 }
 
+// ── Index helpers ──────────────────────────────────────────────────────────────
+
+fn index_by_payer(env: &Env, payer: &Address, id: u64) {
+    let key = payer_index_key(payer);
+    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().persistent().set(&key, &ids);
+}
+
+fn index_by_payee(env: &Env, payee: &Address, id: u64) {
+    let key = payee_index_key(payee);
+    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().persistent().set(&key, &ids);
+}
+
+fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
+    let key = status_index_key(status);
+    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().persistent().set(&key, &ids);
+}
+
+fn index_by_request(env: &Env, request_id: u64, payment_id: u64) {
+    let mut map: Map<u64, u64> = env
+        .storage()
+        .instance()
+        .get(&REQ_IDX)
+        .unwrap_or(Map::new(env));
+    map.set(request_id, payment_id);
+    env.storage().instance().set(&REQ_IDX, &map);
+}
+
+/// Remove `id` from the persistent Vec stored under the given status index key.
+fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
+    let key = status_index_key(status);
+    let ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut new_ids: Vec<u64> = Vec::new(env);
+    for i in 0..ids.len() {
+        let existing = ids.get(i).unwrap();
+        if existing != id {
+            new_ids.push_back(existing);
+        }
+    }
+    env.storage().persistent().set(&key, &new_ids);
+}
+
+// ── Stats helpers ──────────────────────────────────────────────────────────────
+
+fn load_stats(env: &Env) -> PaymentStats {
+    env.storage().instance().get(&STATS_KEY).unwrap_or(PaymentStats {
+        total_locked: 0,
+        total_released: 0,
+        total_refunded: 0,
+        count_locked: 0,
+        count_released: 0,
+        count_refunded: 0,
+    })
+}
+
+fn store_stats(env: &Env, stats: &PaymentStats) {
+    env.storage().instance().set(&STATS_KEY, stats);
+}
+
+fn update_stats_on_transition(
+    env: &Env,
+    amount: i128,
+    old: PaymentStatus,
+    new: PaymentStatus,
+) {
+    let mut stats = load_stats(env);
+    match old {
+        PaymentStatus::Locked => {
+            stats.total_locked -= amount;
+            stats.count_locked = stats.count_locked.saturating_sub(1);
+        }
+        PaymentStatus::Released => {
+            stats.total_released -= amount;
+            stats.count_released = stats.count_released.saturating_sub(1);
+        }
+        PaymentStatus::Refunded => {
+            stats.total_refunded -= amount;
+            stats.count_refunded = stats.count_refunded.saturating_sub(1);
+        }
+        _ => {}
+    }
+    match new {
+        PaymentStatus::Locked => {
+            stats.total_locked += amount;
+            stats.count_locked += 1;
+        }
+        PaymentStatus::Released => {
+            stats.total_released += amount;
+            stats.count_released += 1;
+        }
+        PaymentStatus::Refunded => {
+            stats.total_refunded += amount;
+            stats.count_refunded += 1;
+        }
+        _ => {}
+    }
+    store_stats(env, &stats);
+}
+
+// ── Request-contract cross-contract interface (minimal) ────────────────────────
+
+mod request_client {
+    use soroban_sdk::{contractclient, contracttype, Env};
+
+    #[contracttype]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RequestStatus {
+        Pending,
+        Approved,
+        Fulfilled,
+        Cancelled,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct BloodRequest {
+        pub id: u64,
+        pub status: RequestStatus,
+    }
+
+    #[contractclient(name = "RequestContractClient")]
+    pub trait RequestContractInterface {
+        fn get_request(env: Env, request_id: u64) -> BloodRequest;
+    }
+}
+
+use request_client::{RequestContractClient, RequestStatus as ReqStatus};
+
+/// Returns Ok(()) if `request_id` exists and is in Pending or Approved status.
+fn validate_request_payable(
+    env: &Env,
+    requests_contract: &Address,
+    request_id: u64,
+) -> Result<(), Error> {
+    let client = RequestContractClient::new(env, requests_contract);
+    let req = client
+        .try_get_request(&request_id)
+        .map_err(|_| Error::RequestNotFound)?
+        .map_err(|_| Error::RequestNotFound)?;
+    match req.status {
+        ReqStatus::Pending | ReqStatus::Approved => Ok(()),
+        _ => Err(Error::RequestNotPayable),
+    }
+}
+
 // ── Contract ───────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -222,12 +378,21 @@ pub struct PaymentContract;
 
 #[contractimpl]
 impl PaymentContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    /// Initialize the contract. Optionally provide the address of the requests
+    /// contract so that payment creation can validate request state.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        requests_contract: Option<Address>,
+    ) -> Result<(), Error> {
         admin.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
+        if let Some(rc) = requests_contract {
+            env.storage().instance().set(&REQ_CONTRACT, &rc);
+        }
         Ok(())
     }
 
@@ -262,6 +427,18 @@ impl PaymentContract {
         Ok(())
     }
 
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        if *caller != stored {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     pub fn create_payment(
         env: Env,
         request_id: u64,
@@ -277,6 +454,21 @@ impl PaymentContract {
             return Err(Error::SamePayerPayee);
         }
         payer.require_auth();
+
+        // Reject if a payment for this request already exists.
+        let existing_map: Map<u64, u64> = env
+            .storage()
+            .instance()
+            .get(&REQ_IDX)
+            .unwrap_or(Map::new(&env));
+        if existing_map.contains_key(request_id) {
+            return Err(Error::DuplicatePayment);
+        }
+
+        // Validate request state if the requests contract is configured.
+        if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
+            validate_request_payable(&env, &rc, request_id)?;
+        }
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -294,10 +486,10 @@ impl PaymentContract {
             dispute_reason_code: None,
             dispute_case_id: None,
             dispute_resolved: false,
+            token: None,
         };
 
         store_payment(&env, &payment);
-        // Maintain indexes — O(1) per index
         index_by_payer(&env, &payer, id);
         index_by_payee(&env, &payee, id);
         index_by_status(&env, PaymentStatus::Pending, id);
@@ -308,8 +500,6 @@ impl PaymentContract {
     }
 
     /// Batch-create multiple payments in a single transaction.
-    /// Each tuple is `(request_id, payer, payee, amount)`.
-    /// Returns the Vec of new payment IDs in input order.
     pub fn batch_create_payments(
         env: Env,
         payments: Vec<(u64, Address, Address, i128)>,
@@ -324,6 +514,8 @@ impl PaymentContract {
         Ok(ids)
     }
 
+    /// Create an escrow-backed payment: transfers `amount` of `token` from
+    /// `hospital` into the contract immediately, locking the funds on-chain.
     pub fn create_escrow(
         env: Env,
         request_id: u64,
@@ -340,6 +532,21 @@ impl PaymentContract {
             return Err(Error::SamePayerPayee);
         }
         hospital.require_auth();
+
+        // Reject if a payment for this request already exists.
+        let existing_map: Map<u64, u64> = env
+            .storage()
+            .instance()
+            .get(&REQ_IDX)
+            .unwrap_or(Map::new(&env));
+        if existing_map.contains_key(request_id) {
+            return Err(Error::DuplicatePayment);
+        }
+
+        // Validate request state if the requests contract is configured.
+        if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
+            validate_request_payable(&env, &rc, request_id)?;
+        }
 
         let token_client = token::Client::new(&env, &token);
         let available = token_client.balance(&hospital);
@@ -364,6 +571,7 @@ impl PaymentContract {
             dispute_reason_code: None,
             dispute_case_id: None,
             dispute_resolved: false,
+            token: Some(token.clone()),
         };
 
         store_payment(&env, &payment);
@@ -371,11 +579,94 @@ impl PaymentContract {
         index_by_payee(&env, &payee, id);
         index_by_status(&env, PaymentStatus::Locked, id);
         index_by_request(&env, request_id, id);
-        // Update running stats for the initial Locked state
         update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked);
 
         env.events().publish((symbol_short!("payment"), symbol_short!("escrowed")), id);
         Ok(id)
+    }
+
+    /// Release escrowed funds to the payee. Admin only.
+    /// Transfers the locked amount from the contract to the payee and marks
+    /// the payment as Released.
+    pub fn release_escrow(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
+
+        let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+
+        if payment.status != PaymentStatus::Locked {
+            return Err(Error::PaymentNotLocked);
+        }
+
+        let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &payment.payee,
+            &payment.amount,
+        );
+
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Released;
+        payment.updated_at = env.ledger().timestamp();
+        store_payment(&env, &payment);
+
+        remove_from_status_index(&env, old_status, payment_id);
+        index_by_status(&env, PaymentStatus::Released, payment_id);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Released);
+
+        env.events().publish(
+            (symbol_short!("payment"), symbol_short!("released")),
+            (payment_id, payment.payee.clone(), payment.amount),
+        );
+        Ok(())
+    }
+
+    /// Refund escrowed funds to the payer. Admin only.
+    /// Transfers the locked amount from the contract back to the payer and
+    /// marks the payment as Refunded.
+    pub fn refund_escrow(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
+
+        let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+
+        if payment.status != PaymentStatus::Locked {
+            return Err(Error::PaymentNotLocked);
+        }
+
+        let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &payment.payer,
+            &payment.amount,
+        );
+
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Refunded;
+        payment.updated_at = env.ledger().timestamp();
+        store_payment(&env, &payment);
+
+        remove_from_status_index(&env, old_status, payment_id);
+        index_by_status(&env, PaymentStatus::Refunded, payment_id);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded);
+
+        env.events().publish(
+            (symbol_short!("payment"), symbol_short!("refunded")),
+            (payment_id, payment.payer.clone(), payment.amount),
+        );
+        Ok(())
     }
 
     pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) -> Result<(), Error> {
@@ -385,10 +676,8 @@ impl PaymentContract {
         payment.status = status;
         payment.updated_at = env.ledger().timestamp();
         store_payment(&env, &payment);
-        // Keep status index consistent — O(n) remove + O(1) append
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, status, payment_id);
-        // Update running aggregate stats — O(1)
         update_stats_on_transition(&env, payment.amount, old_status, status);
         Ok(())
     }
@@ -413,7 +702,7 @@ impl PaymentContract {
         update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Disputed);
         env.events().publish(
             (symbol_short!("payment"), symbol_short!("disputed")),
-            (payment_id, case_id),
+            (payment_id, dispute_reason_to_code(reason)),
         );
         Ok(())
     }
@@ -433,13 +722,12 @@ impl PaymentContract {
         Ok(())
     }
 
-    // ── Query functions — all O(1) index lookups or O(page_size) ──────────────
+    // ── Query functions ────────────────────────────────────────────────────────
 
     pub fn get_payment(env: Env, payment_id: u64) -> Result<Payment, Error> {
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
-    /// O(1) lookup via request→payment index map.
     pub fn get_payment_by_request(env: Env, request_id: u64) -> Result<Payment, Error> {
         let map: Map<u64, u64> = env
             .storage()
@@ -450,7 +738,6 @@ impl PaymentContract {
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
-    /// O(page_size) — reads only the IDs in the requested page from the payer index.
     pub fn get_payments_by_payer(
         env: Env,
         payer: Address,
@@ -466,7 +753,6 @@ impl PaymentContract {
         Self::load_page(&env, ids, page, page_size)
     }
 
-    /// O(page_size) — reads only the IDs in the requested page from the payee index.
     pub fn get_payments_by_payee(
         env: Env,
         payee: Address,
@@ -482,7 +768,6 @@ impl PaymentContract {
         Self::load_page(&env, ids, page, page_size)
     }
 
-    /// O(page_size) — reads only the IDs in the requested page from the status index.
     pub fn get_payments_by_status(
         env: Env,
         status: PaymentStatus,
@@ -498,17 +783,14 @@ impl PaymentContract {
         Self::load_page(&env, ids, page, page_size)
     }
 
-    /// O(1) — reads pre-computed running totals, no scan required.
     pub fn get_payment_statistics(env: Env) -> PaymentStats {
         load_stats(&env)
     }
 
-    /// O(page_size) — payments are stored in insertion order (monotone IDs),
-    /// so the timeline is already sorted; no sort needed.
     pub fn get_payment_timeline(env: Env, page: u32, page_size: u32) -> PaymentPage {
         let page_size = if page_size == 0 { 20 } else { page_size };
         let total = get_counter(&env);
-        let start = (page as u64) * (page_size as u64) + 1; // IDs are 1-based
+        let start = (page as u64) * (page_size as u64) + 1;
         let end = (start + page_size as u64 - 1).min(total);
 
         let mut items: Vec<Payment> = Vec::new(&env);
@@ -586,20 +868,6 @@ impl PaymentContract {
 
     // ── Vesting ────────────────────────────────────────────────────────────────
 
-    /// Create a vesting schedule for a donor's reward tokens. Admin only.
-    ///
-    /// Tokens vest linearly from `cliff_timestamp` to `vest_end_timestamp`.
-    /// No tokens can be claimed before the cliff.
-    ///
-    /// # Arguments
-    /// * `donor`         - Recipient of the vested tokens
-    /// * `total_amount`  - Total reward tokens to vest
-    /// * `cliff_secs`    - Seconds from now until the cliff
-    /// * `duration_secs` - Total vesting duration in seconds (from now)
-    ///
-    /// # Errors
-    /// - `Unauthorized`   - Caller is not the admin
-    /// - `InvalidAmount`  - `total_amount` ≤ 0 or `duration_secs` = 0
     pub fn create_vesting(
         env: Env,
         admin: Address,
@@ -646,15 +914,6 @@ impl PaymentContract {
         Ok(())
     }
 
-    /// Claim linearly vested tokens for the calling donor.
-    ///
-    /// Calculates the claimable amount at the current ledger time and transfers
-    /// only that portion to the donor via the reward token contract.
-    ///
-    /// # Errors
-    /// - `VestingNotFound`  - No schedule exists for this donor
-    /// - `CliffNotReached`  - Current time is before the cliff timestamp
-    /// - `NothingToClaim`   - All vested tokens have already been claimed
     pub fn claim_vested(env: Env, donor: Address, reward_token: Address) -> Result<i128, Error> {
         donor.require_auth();
         Self::require_not_paused(&env)?;
@@ -667,13 +926,11 @@ impl PaymentContract {
             return Err(Error::CliffNotReached);
         }
 
-        // Linear vesting: vested = total * elapsed / duration
         let vested = if now >= schedule.vest_end_timestamp {
             schedule.total_amount
         } else {
             let elapsed = now - schedule.cliff_timestamp;
             let duration = schedule.vest_end_timestamp - schedule.cliff_timestamp;
-            // Use i128 arithmetic; duration > 0 guaranteed by create_vesting
             (schedule.total_amount * elapsed as i128) / duration as i128
         };
 
@@ -682,7 +939,6 @@ impl PaymentContract {
             return Err(Error::NothingToClaim);
         }
 
-        // Guard: donor can never claim more than total_amount across all claims
         let new_claimed = schedule.claimed + claimable;
         if new_claimed > schedule.total_amount {
             return Err(Error::NothingToClaim);
@@ -691,7 +947,6 @@ impl PaymentContract {
         schedule.claimed = new_claimed;
         store_vesting(&env, &schedule);
 
-        // Transfer claimable tokens from this contract to the donor
         let token_client = token::Client::new(&env, &reward_token);
         token_client.transfer(&env.current_contract_address(), &donor, &claimable);
 
@@ -703,15 +958,12 @@ impl PaymentContract {
         Ok(claimable)
     }
 
-    /// Get the vesting schedule for a donor.
     pub fn get_vesting(env: Env, donor: Address) -> Result<VestingSchedule, Error> {
         load_vesting(&env, &donor).ok_or(Error::VestingNotFound)
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────────
 
-    /// Load a page of Payment records from a pre-built Vec<u64> of IDs.
-    /// O(page_size) storage reads — no full scan.
     fn load_page(env: &Env, ids: Vec<u64>, page: u32, page_size: u32) -> PaymentPage {
         let total = ids.len() as u64;
         let start = (page as u64) * (page_size as u64);

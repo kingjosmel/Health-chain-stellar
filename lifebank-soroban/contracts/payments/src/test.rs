@@ -470,7 +470,7 @@ fn test_pause_blocks_create_payment() {
     let (env, cid) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &None);
 
     client.pause(&admin);
     assert!(client.is_paused());
@@ -486,7 +486,7 @@ fn test_pause_allows_get_payment() {
     let (env, cid) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &None);
 
     let (id, _, _) = make_payment(&env, &client, 1, 1000);
     client.pause(&admin);
@@ -501,7 +501,7 @@ fn test_unpause_restores_payments() {
     let (env, cid) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &None);
 
     client.pause(&admin);
     client.unpause(&admin);
@@ -517,7 +517,7 @@ fn test_non_admin_cannot_pause_payments() {
     let (env, cid) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &None);
 
     let attacker = Address::generate(&env);
     client.pause(&attacker);
@@ -531,7 +531,7 @@ fn setup_with_admin() -> (Env, Address, Address) {
     let contract_id = env.register(PaymentContract, ());
     let admin = Address::generate(&env);
     let client = PaymentContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
+    client.initialize(&admin, &None);
     (env, contract_id, admin)
 }
 
