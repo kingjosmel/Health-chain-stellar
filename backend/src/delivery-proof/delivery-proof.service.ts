@@ -12,6 +12,7 @@ import { DeliveryProofQueryDto } from './dto/delivery-proof-query.dto';
 import { DeliveryProofEntity } from './entities/delivery-proof.entity';
 import { SorobanService } from '../soroban/soroban.service';
 import { CustodyService } from '../custody/custody.service';
+import { UploadValidationService } from './upload-validation.service';
 
 // Blood products must be stored between 2°C and 6°C (backend compliance threshold)
 const TEMP_MIN_CELSIUS = 2;
@@ -36,42 +37,25 @@ export class DeliveryProofService {
     private readonly configService: ConfigService,
     private readonly sorobanService: SorobanService,
     private readonly custodyService: CustodyService,
+    private readonly uploadValidation: UploadValidationService,
   ) {}
 
-  async uploadPhoto(orderId: string, file: any) {
-    if (!file) {
-      throw new BadRequestException('No file uploaded');
-    }
+  async uploadPhoto(orderId: string, file: Express.Multer.File) {
+    if (!file) throw new BadRequestException('No file uploaded');
 
-    // 1. Validate file type (Issue #464: JPEG/PNG only)
-    const allowedMimeTypes = ['image/jpeg', 'image/png'];
-    if (!allowedMimeTypes.includes(file.mimetype)) {
-      throw new BadRequestException('Only JPEG and PNG images are allowed');
-    }
+    // Validate against photo policy (MIME, extension, size, content sniffing).
+    this.uploadValidation.validate(file, 'photo');
 
-    // 2. Max 5MB check
-    if (file.size > 5 * 1024 * 1024) {
-      throw new BadRequestException('Payload Too Large (Max 5MB)');
-    }
-
-    // 3. Compute SHA-256 hash of raw bytes
     const hash = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const auditMeta = this.uploadValidation.buildAuditMetadata(file, 'photo', hash);
 
-    // 4. Store in object storage (local path)
-    const storagePath = this.configService.get<string>(
-      'STORAGE_PATH',
-      './uploads',
-    );
-    if (!fs.existsSync(storagePath)) {
-      fs.mkdirSync(storagePath, { recursive: true });
-    }
+    const storagePath = this.configService.get<string>('STORAGE_PATH', './uploads');
+    if (!fs.existsSync(storagePath)) fs.mkdirSync(storagePath, { recursive: true });
 
     const fileExt = path.extname(file.originalname) || '.png';
     const fileName = `dp-${orderId}-${Date.now()}${fileExt}`;
-    const filePath = path.join(storagePath, fileName);
-
     try {
-      fs.writeFileSync(filePath, file.buffer);
+      fs.writeFileSync(path.join(storagePath, fileName), file.buffer);
     } catch (err) {
       this.logger.error(`Failed to write file to storage: ${err.message}`);
       throw new BadRequestException('Internal Storage Error');
@@ -79,7 +63,6 @@ export class DeliveryProofService {
 
     const storageUrl = `${storagePath}/${fileName}`;
 
-    // 5. Update Entity
     let proof = await this.proofRepo.findOne({ where: { orderId } });
     if (!proof) {
       proof = this.proofRepo.create({
@@ -97,16 +80,13 @@ export class DeliveryProofService {
     if (!proof.photoHashes) proof.photoHashes = [];
     proof.photoHashes.push(hash);
 
-    // 6. Anchor on Soroban blockchain
     let txId: string | null = null;
     try {
       const anchorResult = await this.sorobanService.anchorHash(orderId, hash);
       txId = anchorResult.transactionHash;
       proof.blockchainTxHash = txId;
     } catch (error) {
-      this.logger.warn(
-        `On-chain anchoring failed for order ${orderId}: ${error.message}`,
-      );
+      this.logger.warn(`On-chain anchoring failed for order ${orderId}: ${error.message}`);
     }
 
     await this.proofRepo.save(proof);
@@ -119,10 +99,10 @@ export class DeliveryProofService {
         sha256Hash: hash,
         storageUrl,
         transactionId: txId,
+        audit: auditMeta,
       },
     };
   }
-
 
   async create(dto: CreateDeliveryProofDto): Promise<DeliveryProofEntity> {
     const pickupTimestamp = new Date(dto.pickupTimestamp);
@@ -167,91 +147,6 @@ export class DeliveryProofService {
     });
 
     return this.proofRepo.save(proof);
-  }
-
-  async uploadPhoto(orderId: string, file: any) {
-    if (!file) {
-      throw new BadRequestException('No file uploaded');
-    }
-
-    // 1. Validate file type (Issue #464: JPEG/PNG only)
-    const allowedMimeTypes = ['image/jpeg', 'image/png'];
-    if (!allowedMimeTypes.includes(file.mimetype)) {
-      throw new BadRequestException('Only JPEG and PNG images are allowed');
-    }
-
-    // 2. Max 5MB check
-    if (file.size > 5 * 1024 * 1024) {
-      throw new BadRequestException('Payload Too Large (Max 5MB)');
-    }
-
-    // 3. Compute SHA-256 hash of raw bytes
-    const hash = crypto.createHash('sha256').update(file.buffer).digest('hex');
-
-    // 4. Store in object storage (local path)
-    const storagePath = this.configService.get<string>(
-      'STORAGE_PATH',
-      './uploads',
-    );
-    if (!fs.existsSync(storagePath)) {
-      fs.mkdirSync(storagePath, { recursive: true });
-    }
-
-    const fileExt = path.extname(file.originalname) || '.png';
-    const fileName = `dp-${orderId}-${Date.now()}${fileExt}`;
-    const filePath = path.join(storagePath, fileName);
-
-    try {
-      fs.writeFileSync(filePath, file.buffer);
-    } catch (err) {
-      this.logger.error(`Failed to write file to storage: ${err.message}`);
-      throw new BadRequestException('Internal Storage Error');
-    }
-
-    const storageUrl = `${storagePath}/${fileName}`;
-
-    // 5. Update Entity
-    let proof = await this.proofRepo.findOne({ where: { orderId } });
-    if (!proof) {
-      proof = this.proofRepo.create({
-        orderId,
-        riderId: 'SYSTEM',
-        pickupTimestamp: new Date(),
-        deliveredAt: new Date(),
-        recipientName: 'Automatic Verification',
-        temperatureReadings: [4.0],
-        photoHashes: [],
-      });
-    }
-
-    proof.photoUrl = storageUrl;
-    if (!proof.photoHashes) proof.photoHashes = [];
-    proof.photoHashes.push(hash);
-
-    // 6. Anchor on Soroban blockchain
-    let txId: string | null = null;
-    try {
-      const anchorResult = await this.sorobanService.anchorHash(orderId, hash);
-      txId = anchorResult.transactionHash;
-      proof.blockchainTxHash = txId;
-    } catch (error) {
-      this.logger.warn(
-        `On-chain anchoring failed for order ${orderId}: ${error.message}`,
-      );
-    }
-
-    await this.proofRepo.save(proof);
-
-    return {
-      success: true,
-      message: 'Delivery proof photo uploaded and anchored',
-      data: {
-        orderId,
-        sha256Hash: hash,
-        storageUrl,
-        transactionId: txId,
-      },
-    };
   }
 
   async getDeliveryProof(id: string): Promise<DeliveryProofEntity> {

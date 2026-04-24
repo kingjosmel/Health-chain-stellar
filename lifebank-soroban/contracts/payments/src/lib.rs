@@ -131,6 +131,8 @@ pub enum Error {
     NotEscrowPayment = 514,
     /// Payment is not in the Locked state required for settlement.
     PaymentNotLocked = 515,
+    /// Dispute timeout has not yet elapsed.
+    DisputeNotExpired = 516,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -146,6 +148,10 @@ const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
 const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
 /// Instance storage key for the requests contract address (optional).
 const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
+/// Default dispute auto-refund timeout in seconds (7 days).
+const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
+/// Instance storage key for the dispute timeout override.
+const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
 
 fn payment_key(id: u64) -> (u64, &'static str) {
     (id, "pay")
@@ -349,6 +355,12 @@ mod request_client {
     #[contractclient(name = "RequestContractClient")]
     pub trait RequestContractInterface {
         fn get_request(env: Env, request_id: u64) -> BloodRequest;
+        fn update_request_status(
+            env: Env,
+            caller: soroban_sdk::Address,
+            request_id: u64,
+            new_status: RequestStatus,
+        ) -> Result<(), soroban_sdk::Error>;
     }
 }
 
@@ -369,6 +381,18 @@ fn validate_request_payable(
         ReqStatus::Pending | ReqStatus::Approved => Ok(()),
         _ => Err(Error::RequestNotPayable),
     }
+}
+
+/// Attempt to move the linked request to Cancelled via the requests contract.
+/// Silently ignores failures (request may already be terminal or contract not configured).
+fn try_cancel_request(env: &Env, requests_contract: &Address, request_id: u64) {
+    let client = RequestContractClient::new(env, requests_contract);
+    // Best-effort: ignore errors so the payment refund is never blocked.
+    let _ = client.try_update_request_status(
+        &env.current_contract_address(),
+        &request_id,
+        &ReqStatus::Cancelled,
+    );
 }
 
 // ── Contract ───────────────────────────────────────────────────────────────────
@@ -960,6 +984,84 @@ impl PaymentContract {
 
     pub fn get_vesting(env: Env, donor: Address) -> Result<VestingSchedule, Error> {
         load_vesting(&env, &donor).ok_or(Error::VestingNotFound)
+    }
+
+    // ── Dispute timeout (#595) ─────────────────────────────────────────────────
+
+    /// Override the dispute auto-refund timeout. Admin only.
+    pub fn set_dispute_timeout(env: Env, admin: Address, timeout_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DISPUTE_TIMEOUT, &timeout_secs);
+        Ok(())
+    }
+
+    /// Refund all Disputed+escrowed payments whose dispute has exceeded the
+    /// timeout window, cancel the linked request, and emit events so off-chain
+    /// projections can reconcile request state. Admin only.
+    pub fn process_expired_disputes(
+        env: Env,
+        admin: Address,
+        payment_ids: Vec<u64>,
+    ) -> Result<Vec<u64>, Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        let timeout: u64 = env
+            .storage()
+            .instance()
+            .get(&DISPUTE_TIMEOUT)
+            .unwrap_or(DEFAULT_DISPUTE_TIMEOUT_SECS);
+        let now = env.ledger().timestamp();
+        let req_contract: Option<Address> =
+            env.storage().instance().get::<_, Address>(&REQ_CONTRACT);
+
+        let mut refunded: Vec<u64> = Vec::new(&env);
+
+        for i in 0..payment_ids.len() {
+            let pid = payment_ids.get(i).unwrap();
+            let mut payment = match load_payment(&env, pid) {
+                Some(p) => p,
+                None => continue,
+            };
+            if payment.status != PaymentStatus::Disputed { continue; }
+            if payment.token.is_none() { continue; }
+            if now < payment.updated_at + timeout { continue; }
+
+            let token_client = token::Client::new(&env, payment.token.as_ref().unwrap());
+            token_client.transfer(
+                &env.current_contract_address(),
+                &payment.payer,
+                &payment.amount,
+            );
+
+            let old_status = payment.status;
+            payment.status = PaymentStatus::Refunded;
+            payment.updated_at = now;
+            store_payment(&env, &payment);
+            remove_from_status_index(&env, old_status, pid);
+            index_by_status(&env, PaymentStatus::Refunded, pid);
+            update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded);
+
+            if let Some(ref rc) = req_contract {
+                try_cancel_request(&env, rc, payment.request_id);
+            }
+
+            env.events().publish(
+                (symbol_short!("payment"), symbol_short!("refunded")),
+                (pid, payment.payer.clone(), payment.amount),
+            );
+            // Request-level event for off-chain projections.
+            env.events().publish(
+                (symbol_short!("request"), symbol_short!("cancelled")),
+                (payment.request_id, pid, now),
+            );
+
+            refunded.push_back(pid);
+        }
+
+        Ok(refunded)
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────────

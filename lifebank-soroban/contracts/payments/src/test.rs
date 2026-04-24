@@ -137,6 +137,69 @@ fn test_get_payment_by_request_returns_not_found() {
     assert!(result.is_err());
 }
 
+// ── duplicate-payment prevention (#599) ───────────────────────────────────────
+
+#[test]
+fn test_create_payment_rejects_duplicate_request_id() {
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    // First payment for request 42 succeeds.
+    make_payment(&env, &client, 42, 500);
+    // Second payment for the same request must be rejected.
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let result = client.try_create_payment(&42u64, &payer, &payee, &500i128);
+    assert_eq!(result, Err(Ok(Error::DuplicatePayment)));
+}
+
+#[test]
+fn test_create_escrow_rejects_duplicate_request_id() {
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+
+    // First escrow for request 7 succeeds.
+    client.create_escrow(&7u64, &hospital, &payee, &1_000i128, &token_id);
+
+    // Second escrow for the same request must be rejected.
+    let result = client.try_create_escrow(&7u64, &hospital, &payee, &500i128, &token_id);
+    assert_eq!(result, Err(Ok(Error::DuplicatePayment)));
+}
+
+#[test]
+fn test_get_payment_by_request_resolves_without_full_scan() {
+    // Verify the index lookup returns the correct payment even when many
+    // payments exist for other request IDs.
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    for i in 1u64..=20 {
+        make_payment(&env, &client, i, 100);
+    }
+    let target_request_id = 13u64;
+    let p = client.get_payment_by_request(&target_request_id);
+    assert_eq!(p.request_id, target_request_id);
+}
+
+#[test]
+fn test_terminal_payment_does_not_block_new_active_payment_for_different_request() {
+    // Payments for distinct request IDs must never interfere.
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let (id1, _, _) = make_payment(&env, &client, 100, 200);
+    client.update_status(&id1, &PaymentStatus::Refunded);
+
+    // A payment for a different request must still be accepted.
+    let (id2, _, _) = make_payment(&env, &client, 101, 300);
+    assert!(id2 > id1);
+    let p = client.get_payment_by_request(&101u64);
+    assert_eq!(p.id, id2);
+}
+
 // ── get_payments_by_payer ──────────────────────────────────────────────────────
 
 #[test]
@@ -640,6 +703,85 @@ fn test_vesting_only_admin_can_create() {
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let result = client.try_create_vesting(&attacker, &donor, &1_000i128, &100u64, &500u64);
     assert!(result.is_err(), "Non-admin must not create vesting");
+}
+
+// ── process_expired_disputes (#595) ─────────────────────────────────────────────────
+
+#[test]
+fn test_process_expired_disputes_refunds_after_timeout() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    // Record dispute at t=1000; updated_at becomes 1000.
+    client.record_dispute(&pid, &DisputeReason::FailedDelivery,
+        &soroban_sdk::String::from_str(&env, "case-1"));
+
+    // Set a short timeout of 500s.
+    client.set_dispute_timeout(&admin, &500u64);
+
+    // Advance time past timeout.
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(pid);
+    let refunded = client.process_expired_disputes(&admin, &ids);
+    assert_eq!(refunded.len(), 1);
+    assert_eq!(refunded.get(0).unwrap(), pid);
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Refunded);
+}
+
+#[test]
+fn test_process_expired_disputes_skips_non_expired() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&2u64, &hospital, &payee, &500i128, &token_id);
+    client.record_dispute(&pid, &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case-2"));
+
+    client.set_dispute_timeout(&admin, &5_000u64);
+
+    // Only 100s elapsed — not expired.
+    env.ledger().with_mut(|l| l.timestamp = 1_100);
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(pid);
+    let refunded = client.process_expired_disputes(&admin, &ids);
+    assert_eq!(refunded.len(), 0);
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Disputed);
+}
+
+#[test]
+fn test_process_expired_disputes_skips_non_disputed_payments() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, _, _) = make_payment(&env, &client, 3, 200);
+    // Payment is Pending, not Disputed.
+    client.set_dispute_timeout(&admin, &1u64);
+    env.ledger().with_mut(|l| l.timestamp = 9_000);
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(pid);
+    let refunded = client.process_expired_disputes(&admin, &ids);
+    assert_eq!(refunded.len(), 0);
 }
 
 /// VestingCreated and VestingClaimed events are emitted.
