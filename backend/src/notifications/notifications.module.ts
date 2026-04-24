@@ -1,6 +1,5 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
-import { EventEmitterModule } from '@nestjs/event-emitter';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { PolicyCenterModule } from '../policy-center/policy-center.module';
@@ -33,7 +32,6 @@ import { SmsProvider } from './providers/sms.provider';
     BullModule.registerQueue({
       name: 'notifications',
     }),
-    EventEmitterModule.forRoot(),
     PolicyCenterModule,
   ],
   controllers: [NotificationsController, NotificationPreferenceController],

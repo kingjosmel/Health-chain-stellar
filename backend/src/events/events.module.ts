@@ -1,6 +1,5 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
-import { EventEmitterModule } from '@nestjs/event-emitter';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { OutboxConsumer } from './outbox-consumer';
@@ -14,7 +13,6 @@ import { OutboxService } from './outbox.service';
     BullModule.registerQueue({
       name: 'outbox-events',
     }),
-    EventEmitterModule.forRoot(),
   ],
   providers: [OutboxService, OutboxProducer, OutboxConsumer],
   exports: [OutboxService],

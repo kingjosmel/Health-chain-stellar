@@ -1,6 +1,5 @@
 import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
-import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
@@ -52,7 +51,6 @@ import { RestockingCampaignController } from './controllers/restocking-campaign.
       name: 'donor-outreach',
     }),
     ScheduleModule.forRoot(),
-    EventEmitterModule.forRoot(),
     NotificationsModule,
     UsersModule,
   ],
